@@ -340,6 +340,11 @@ struct Scratch {
 
     // whether to use item_args
     parametric: bool,
+
+    // Hash set for O(1) deduplication in add_unique.
+    // Stores (Item.data, ParamValue.0) pairs for the current row.
+    // Cleared on each new_row().
+    row_item_set: HashSet<(u64, u64)>,
 }
 
 #[derive(Clone)]
@@ -522,6 +527,7 @@ impl Scratch {
             grammar_stack: vec![],
             definitive: true,
             log_override: false,
+            row_item_set: HashSet::default(),
         }
     }
 
@@ -534,6 +540,7 @@ impl Scratch {
     fn new_row(&mut self, pos: usize) {
         self.row_start = pos;
         self.row_end = pos;
+        self.row_item_set.clear();
     }
 
     // Number of items in the current working Earley set
@@ -601,6 +608,8 @@ impl Scratch {
                 self.item_args[self.row_end] = param;
             }
         }
+        // Keep hash set in sync for callers that bypass add_unique_arg
+        self.row_item_set.insert((item.data, param.0));
         if self.log_enabled() {
             debug!(
                 "      addu: {} ({}) ::{}",
@@ -633,20 +642,12 @@ impl Scratch {
     // Ensure that Earley table 'self' contains
     // Earley item 'item'.  That is, look for 'item' in 'self',
     // and add 'item' to 'self' if it is not there already.
+    // Uses a hash set for O(1) amortized deduplication.
     #[inline(always)]
     fn add_unique_arg(&mut self, item: Item, info: &str, param: ParamValue) {
-        if self.parametric {
-            for idx in self.row_start..self.row_end {
-                if self.items[idx] == item && self.item_args[idx] == param {
-                    return;
-                }
-            }
+        let key = (item.data, param.0);
+        if self.row_item_set.insert(key) {
             self.just_add(item, param, info);
-        } else {
-            // otherwise, simple add
-            if self.find_item(item).is_none() {
-                self.just_add(item, param, info);
-            }
         }
     }
 
