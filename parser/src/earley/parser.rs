@@ -452,6 +452,11 @@ struct ParserState {
     rows: Vec<Row>,
     rows_valid_end: usize,
 
+    // Cached completion index: maps row_index -> (symbol_at_dot -> [item_indices]).
+    // Used for O(1) completion lookups in process_agenda.
+    // Invalidated per-row when rows are overwritten in just_push_row.
+    completion_index: HashMap<usize, HashMap<CSymIdx, Vec<usize>>>,
+
     trace_byte_stack: Vec<u8>,
     trace_stats0: ParserStats,
     trace_start: Instant,
@@ -717,6 +722,7 @@ impl ParserState {
             trie_lexer_stack: usize::MAX,
             rows: vec![],
             rows_valid_end: 0,
+            completion_index: HashMap::default(),
             row_infos: vec![],
             captures: Captures::new(),
             scratch,
@@ -2041,10 +2047,28 @@ impl ParserState {
                     // if item.start_pos() == curr_idx, then we handled it below in the nullable check
 
                     // The main completion inference rule (slide 21 in Kallmeyer 2018)
-                    for i in self.rows[item.start_pos()].item_indices() {
-                        let item = self.scratch.items[i];
-                        if self.grammar.sym_idx_dot(item.rhs_ptr()) == lhs {
-                            self.scratch.add_unique(item.advance_dot(), i, "complete");
+                    // Use a lazy completion index for O(1) lookup instead of O(N) scan.
+                    let start_pos = item.start_pos();
+                    if !self.completion_index.contains_key(&start_pos) {
+                        let mut m: HashMap<CSymIdx, Vec<usize>> = HashMap::default();
+                        for i in self.rows[start_pos].item_indices() {
+                            let sym =
+                                self.grammar.sym_idx_dot(self.scratch.items[i].rhs_ptr());
+                            if sym != CSymIdx::NULL {
+                                m.entry(sym).or_default().push(i);
+                            }
+                        }
+                        self.completion_index.insert(start_pos, m);
+                    }
+                    if let Some(items_for_lhs) =
+                        self.completion_index.get(&start_pos).unwrap().get(&lhs)
+                    {
+                        for &i in items_for_lhs {
+                            self.scratch.add_unique(
+                                self.scratch.items[i].advance_dot(),
+                                i,
+                                "complete",
+                            );
                         }
                     }
                 }
@@ -2163,6 +2187,11 @@ impl ParserState {
                 // stack as tracked by the lexer.
                 self.rows[idx] = row;
             }
+
+            // Invalidate cached completion index for this row position
+            // (the row content has changed).
+            self.completion_index.remove(&idx);
+
             self.rows_valid_end = idx + 1;
 
             if self.scratch.definitive {
