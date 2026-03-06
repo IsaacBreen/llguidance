@@ -278,12 +278,12 @@ pub struct ParserLimits {
 impl Default for ParserLimits {
     fn default() -> Self {
         Self {
-            max_items_in_row: 2000,
-            initial_lexer_fuel: 1_000_000, // fhir schema => 500k
-            step_lexer_fuel: 200_000,      //
-            max_lexer_states: 250_000,     //
-            max_grammar_size: 500_000,     // fhir schema => 200k
-            step_max_items: 50_000,        //
+            max_items_in_row: usize::MAX,
+            initial_lexer_fuel: u64::MAX,
+            step_lexer_fuel: u64::MAX,
+            max_lexer_states: usize::MAX,
+            max_grammar_size: usize::MAX,
+            step_max_items: usize::MAX,
             precompute_large_lexemes: true,
             verbose_errors: true,
         }
