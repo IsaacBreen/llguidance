@@ -823,7 +823,7 @@ impl ParserState {
         lbl: &str,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        self.max_all_items = self.stats.all_items + limit;
+        self.max_all_items = self.stats.all_items.saturating_add(limit);
 
         let r = f(self);
 
