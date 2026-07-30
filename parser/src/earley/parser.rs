@@ -4191,7 +4191,17 @@ impl BiasRecognizer for AnyParserRecognizer<'_> {
 
 pub trait BiasComputer: Send + Sync {
     fn compute_bias(&self, rec: &mut ParserRecognizer<'_>, start: &[u8]) -> SimpleVob;
-    fn compute_bias_greedy(&self, rec: &mut GreedyParserRecognizer<'_>, start: &[u8]) -> SimpleVob;
+
+    /// Checkpoint-aware mask computation. Existing implementations remain
+    /// source-compatible; the default performs an unsliced trie traversal.
+    /// Implementations may override this to preserve their normal fast paths.
+    #[doc(hidden)]
+    fn compute_bias_greedy(&self, rec: &mut GreedyParserRecognizer<'_>, start: &[u8]) -> SimpleVob {
+        let mut set = self.trie().alloc_token_set();
+        self.trie().add_bias(rec, &mut set, start);
+        set
+    }
+
     fn trie(&self) -> &TokTrie;
 }
 
