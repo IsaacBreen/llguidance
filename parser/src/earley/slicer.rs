@@ -5,7 +5,7 @@ use derivre::{HashMap, HashSet, RegexBuilder};
 
 use crate::{
     derivre::Regex,
-    earley::{BiasComputer, ParserRecognizer},
+    earley::{BiasComputer, BiasRecognizer, GreedyParserRecognizer, ParserRecognizer},
     toktrie::{SimpleVob, TokEnv, TokTrie, TokenId},
 };
 
@@ -83,7 +83,6 @@ impl TokenizerSlice {
         if self.regex.is_empty() {
             return false;
         }
-        // set to at least 500
         let budget = 1000;
         let lexer_state = rec.lexer_state();
         let res = rec
@@ -103,8 +102,6 @@ impl TokenizerSlice {
         rec.metrics_mut().slicer_leftover_us += us;
     }
 
-    // possibly sets bits corresponding to matching tokens in the current slice
-    // returns true if it did
     fn apply(&self, rec: &mut ParserRecognizer<'_>, trg: &mut SimpleVob) -> bool {
         if self.matches(rec) {
             rec.stats_mut().slices_applied += 1;
@@ -121,22 +118,16 @@ impl TokenizerSlice {
                         first_applied_idx = Some(idx);
                     } else {
                         if num_applied == 2 {
-                            // we didn't do this one in the first place (to avoid allocation)
                             applied_indices.push(first_applied_idx.unwrap());
                         }
                         applied_indices.push(idx);
                     }
                 }
             }
-
             let to_apply = match num_applied {
-                // no children applied, we leave application to the caller
                 0 => return false,
-                // only one child applied - use the trie built exactly for this purpose
                 1 => &self.trie_without_child[first_applied_idx.unwrap()],
-                // otherwise apply children that have not been applied yet
                 _ => {
-                    // only iterate over children if we didn't apply some
                     if applied_indices.len() < self.children.len() {
                         for (idx, c) in self.children.iter().enumerate() {
                             if !applied_indices.contains(&idx) {
@@ -144,16 +135,75 @@ impl TokenizerSlice {
                             }
                         }
                     }
-                    // and then we'll apply nodes for this slice only
                     &self.trie_without_children
                 }
             };
-
             let t0 = crate::Instant::now();
             to_apply.add_bias(rec, trg, &[]);
             let us = t0.elapsed().as_micros() as usize;
             rec.metrics_mut().slicer_leftover_us += us;
+            true
+        }
+    }
 
+    fn matches_greedy(&self, rec: &mut GreedyParserRecognizer<'_>) -> bool {
+        if self.regex.is_empty() || rec.has_greedy_checkpoint() {
+            return false;
+        }
+        let budget = 1000;
+        let lexer_state = rec.lexer_state();
+        rec.lexer_mut()
+            .check_subsume(lexer_state, self.idx, budget)
+            .unwrap_or(false)
+    }
+
+    fn trie_apply_greedy(&self, rec: &mut GreedyParserRecognizer<'_>, trg: &mut SimpleVob) {
+        let t0 = crate::Instant::now();
+        self.trie_with_children.add_bias(rec, trg, &[]);
+        let us = t0.elapsed().as_micros() as usize;
+        rec.metrics_mut().slicer_leftover_us += us;
+    }
+
+    fn apply_greedy(&self, rec: &mut GreedyParserRecognizer<'_>, trg: &mut SimpleVob) -> bool {
+        if self.matches_greedy(rec) {
+            rec.stats_mut().slices_applied += 1;
+            trg.or(&self.mask_trimmed);
+            true
+        } else {
+            let mut num_applied = 0;
+            let mut first_applied_idx = None;
+            let mut applied_indices = vec![];
+            for (idx, c) in self.children.iter().enumerate() {
+                if c.apply_greedy(rec, trg) {
+                    num_applied += 1;
+                    if num_applied == 1 {
+                        first_applied_idx = Some(idx);
+                    } else {
+                        if num_applied == 2 {
+                            applied_indices.push(first_applied_idx.unwrap());
+                        }
+                        applied_indices.push(idx);
+                    }
+                }
+            }
+            let to_apply = match num_applied {
+                0 => return false,
+                1 => &self.trie_without_child[first_applied_idx.unwrap()],
+                _ => {
+                    if applied_indices.len() < self.children.len() {
+                        for (idx, c) in self.children.iter().enumerate() {
+                            if !applied_indices.contains(&idx) {
+                                c.trie_apply_greedy(rec, trg);
+                            }
+                        }
+                    }
+                    &self.trie_without_children
+                }
+            };
+            let t0 = crate::Instant::now();
+            to_apply.add_bias(rec, trg, &[]);
+            let us = t0.elapsed().as_micros() as usize;
+            rec.metrics_mut().slicer_leftover_us += us;
             true
         }
     }
@@ -374,17 +424,34 @@ impl BiasComputer for SlicedBiasComputer {
             && rec.lexer_mut().subsume_possible(lexer_state)
             && self.top_slice.apply(rec, &mut set)
         {
-            // OK! applied
+            // applied
         } else {
-            // if not top-level applied, or cannot apply, do it by hand
             self.top_slice
                 .trie_with_children
                 .add_bias(rec, &mut set, start);
             debug!("slicer disabled; {} tokens", set.num_set());
         }
-
         debug!("");
+        set
+    }
 
+    fn compute_bias_greedy(&self, rec: &mut GreedyParserRecognizer<'_>, start: &[u8]) -> SimpleVob {
+        let mut set = self.trie().alloc_token_set();
+        let lexer_state = rec.lexer_state();
+        if !self.top_slice.children.is_empty()
+            && start.is_empty()
+            && !rec.has_greedy_checkpoint()
+            && rec.lexer_mut().subsume_possible(lexer_state)
+            && self.top_slice.apply_greedy(rec, &mut set)
+        {
+            // applied
+        } else {
+            self.top_slice
+                .trie_with_children
+                .add_bias(rec, &mut set, start);
+            debug!("slicer disabled; {} tokens", set.num_set());
+        }
+        debug!("");
         set
     }
 
