@@ -5,7 +5,7 @@ use derivre::{HashMap, HashSet, RegexBuilder};
 
 use crate::{
     derivre::Regex,
-    earley::{BiasComputer, BiasRecognizer, GreedyParserRecognizer, ParserRecognizer},
+    earley::{BiasComputer, GreedyParserRecognizer, ParserRecognizer},
     toktrie::{SimpleVob, TokEnv, TokTrie, TokenId},
 };
 

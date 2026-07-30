@@ -16,7 +16,7 @@ pub struct LexerSpec {
     pub regex_builder: RegexBuilder,
     pub no_forcing: bool,
     pub allow_initial_skip: bool,
-    pub greedy_lexeme_fallback: bool,
+    pub(crate) greedy_lexeme_fallback: bool,
     pub num_extra_lexemes: usize,
     pub skip_by_class: Vec<LexemeIdx>,
     class_by_skip: HashMap<ExprRef, LexemeClass>,

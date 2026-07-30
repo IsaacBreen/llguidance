@@ -60,7 +60,7 @@ pub enum LexerResult {
 }
 
 #[derive(Debug)]
-pub enum GreedyLexerResult {
+pub(super) enum GreedyLexerResult {
     Lexeme(PreLexeme),
     SpecialToken(StateID),
     State(StateID, u8),
@@ -284,7 +284,7 @@ impl Lexer {
     /// intentionally left unchanged so grammars without greedy fallback retain
     /// the original hot path.
     #[inline(always)]
-    pub fn advance_greedy(
+    pub(super) fn advance_greedy(
         &mut self,
         prev: StateID,
         byte: u8,

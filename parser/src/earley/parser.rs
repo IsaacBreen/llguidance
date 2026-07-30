@@ -4086,112 +4086,45 @@ pub struct GreedyParserRecognizer<'a> {
     state: &'a mut GreedyParserState,
 }
 
-/// A branch-aware recognizer for low-level callers that need to work with
-/// either parser backend. The normal and greedy recognizers remain separate in
-/// mask generation so the default hot path stays monomorphized.
-pub enum AnyParserRecognizer<'a> {
-    Normal(ParserRecognizer<'a>),
-    Greedy(GreedyParserRecognizer<'a>),
-}
-
 impl GreedyParserRecognizer<'_> {
     pub fn has_greedy_checkpoint(&self) -> bool {
         self.state.tag() != GreedyCheckpoint::None || self.state.shadow.is_some()
     }
-}
 
-pub trait BiasRecognizer: Recognizer {
-    fn lexer_mut(&mut self) -> &mut Lexer;
-    fn lexer(&self) -> &Lexer;
-    fn lexer_state(&self) -> StateID;
-    fn stats_mut(&mut self) -> &mut ParserStats;
-    fn metrics_mut(&mut self) -> &mut ParserMetrics;
-}
-
-impl BiasRecognizer for ParserRecognizer<'_> {
-    fn lexer_mut(&mut self) -> &mut Lexer {
-        self.state.lexer_mut()
-    }
-
-    fn lexer(&self) -> &Lexer {
-        self.state.lexer()
-    }
-
-    fn lexer_state(&self) -> StateID {
-        self.state.lexer_state().lexer_state
-    }
-
-    fn stats_mut(&mut self) -> &mut ParserStats {
-        &mut self.state.stats
-    }
-
-    fn metrics_mut(&mut self) -> &mut ParserMetrics {
-        &mut self.state.metrics
-    }
-}
-
-impl BiasRecognizer for GreedyParserRecognizer<'_> {
-    fn lexer_mut(&mut self) -> &mut Lexer {
+    pub fn lexer_mut(&mut self) -> &mut Lexer {
         self.state.inner.lexer_mut()
     }
 
-    fn lexer(&self) -> &Lexer {
+    pub fn lexer(&self) -> &Lexer {
         self.state.inner.lexer()
     }
 
-    fn lexer_state(&self) -> StateID {
+    pub fn lexer_state(&self) -> StateID {
         self.state.inner.lexer_state().lexer_state
     }
 
-    fn stats_mut(&mut self) -> &mut ParserStats {
+    pub fn stats_mut(&mut self) -> &mut ParserStats {
         &mut self.state.inner.stats
     }
 
-    fn metrics_mut(&mut self) -> &mut ParserMetrics {
+    pub fn metrics_mut(&mut self) -> &mut ParserMetrics {
         &mut self.state.inner.metrics
-    }
-}
-
-impl BiasRecognizer for AnyParserRecognizer<'_> {
-    fn lexer_mut(&mut self) -> &mut Lexer {
-        match self {
-            Self::Normal(recognizer) => recognizer.lexer_mut(),
-            Self::Greedy(recognizer) => recognizer.lexer_mut(),
-        }
-    }
-
-    fn lexer(&self) -> &Lexer {
-        match self {
-            Self::Normal(recognizer) => recognizer.lexer(),
-            Self::Greedy(recognizer) => recognizer.lexer(),
-        }
-    }
-
-    fn lexer_state(&self) -> StateID {
-        match self {
-            Self::Normal(recognizer) => recognizer.lexer_state(),
-            Self::Greedy(recognizer) => recognizer.lexer_state(),
-        }
-    }
-
-    fn stats_mut(&mut self) -> &mut ParserStats {
-        match self {
-            Self::Normal(recognizer) => recognizer.stats_mut(),
-            Self::Greedy(recognizer) => recognizer.stats_mut(),
-        }
-    }
-
-    fn metrics_mut(&mut self) -> &mut ParserMetrics {
-        match self {
-            Self::Normal(recognizer) => recognizer.metrics_mut(),
-            Self::Greedy(recognizer) => recognizer.metrics_mut(),
-        }
     }
 }
 
 pub trait BiasComputer: Send + Sync {
     fn compute_bias(&self, rec: &mut ParserRecognizer<'_>, start: &[u8]) -> SimpleVob;
-    fn compute_bias_greedy(&self, rec: &mut GreedyParserRecognizer<'_>, start: &[u8]) -> SimpleVob;
+
+    /// Checkpoint-aware mask computation. Existing implementations remain
+    /// source-compatible; the default performs an unsliced trie traversal.
+    /// Implementations may override this to preserve their normal fast paths.
+    #[doc(hidden)]
+    fn compute_bias_greedy(&self, rec: &mut GreedyParserRecognizer<'_>, start: &[u8]) -> SimpleVob {
+        let mut set = self.trie().alloc_token_set();
+        self.trie().add_bias(rec, &mut set, start);
+        set
+    }
+
     fn trie(&self) -> &TokTrie;
 }
 
@@ -4346,57 +4279,6 @@ impl ParserError {
     }
 }
 
-impl Recognizer for AnyParserRecognizer<'_> {
-    fn pop_bytes(&mut self, num: usize) {
-        match self {
-            Self::Normal(recognizer) => recognizer.pop_bytes(num),
-            Self::Greedy(recognizer) => recognizer.pop_bytes(num),
-        }
-    }
-
-    fn collapse(&mut self) {
-        match self {
-            Self::Normal(recognizer) => recognizer.collapse(),
-            Self::Greedy(recognizer) => recognizer.collapse(),
-        }
-    }
-
-    fn trie_started(&mut self, label: &str) {
-        match self {
-            Self::Normal(recognizer) => recognizer.trie_started(label),
-            Self::Greedy(recognizer) => recognizer.trie_started(label),
-        }
-    }
-
-    fn trie_finished(&mut self) {
-        match self {
-            Self::Normal(recognizer) => recognizer.trie_finished(),
-            Self::Greedy(recognizer) => recognizer.trie_finished(),
-        }
-    }
-
-    fn try_push_byte(&mut self, byte: u8) -> bool {
-        match self {
-            Self::Normal(recognizer) => recognizer.try_push_byte(byte),
-            Self::Greedy(recognizer) => recognizer.try_push_byte(byte),
-        }
-    }
-
-    fn get_error(&mut self) -> Option<String> {
-        match self {
-            Self::Normal(recognizer) => recognizer.get_error(),
-            Self::Greedy(recognizer) => recognizer.get_error(),
-        }
-    }
-
-    fn save_stats(&mut self, nodes_walked: usize) {
-        match self {
-            Self::Normal(recognizer) => recognizer.save_stats(nodes_walked),
-            Self::Greedy(recognizer) => recognizer.save_stats(nodes_walked),
-        }
-    }
-}
-
 impl Parser {
     pub fn new(
         tok_env: TokEnv,
@@ -4499,7 +4381,7 @@ impl Parser {
         None
     }
 
-    pub fn chop_tokens(&mut self, trie: &TokTrie, tokens: &[TokenId]) -> (usize, usize) {
+    pub(crate) fn chop_tokens(&mut self, trie: &TokTrie, tokens: &[TokenId]) -> (usize, usize) {
         if !self.uses_greedy() {
             self.with_shared(|state| {
                 let mut recognizer = ParserRecognizer { state };
@@ -4513,38 +4395,33 @@ impl Parser {
         }
     }
 
-    /// Access the original recognizer. This method is retained for callers
-    /// that require the concrete normal recognizer; use [`Parser::with_any_recognizer`]
-    /// when the grammar may enable greedy lexeme fallback.
+    /// Access the ordinary recognizer. Greedy-fallback parsers use a separate
+    /// internal recognizer and cannot be exposed through this legacy hook.
     pub fn with_recognizer<T>(&mut self, f: impl FnOnce(&mut ParserRecognizer) -> T) -> T {
         assert!(
             !self.uses_greedy(),
-            "with_recognizer is unavailable with greedy_lexeme_fallback; use with_any_recognizer"
+            "with_recognizer is unavailable with greedy_lexeme_fallback; use with_greedy_recognizer"
         );
         self.with_shared(|state| {
-            let mut recognizer = ParserRecognizer { state };
-            f(&mut recognizer)
+            let mut rec = ParserRecognizer { state };
+            f(&mut rec)
         })
     }
 
-    /// Access a recognizer that supports either parser backend. This dispatches
-    /// once when the callback is entered; mask generation continues to use the
-    /// separate concrete recognizers directly.
-    pub fn with_any_recognizer<T>(
+    /// Access the checkpoint-aware recognizer for an opt-in greedy parser.
+    #[doc(hidden)]
+    pub fn with_greedy_recognizer<T>(
         &mut self,
-        f: impl FnOnce(&mut AnyParserRecognizer<'_>) -> T,
+        f: impl FnOnce(&mut GreedyParserRecognizer<'_>) -> T,
     ) -> T {
-        if !self.uses_greedy() {
-            self.with_shared(|state| {
-                let mut recognizer = AnyParserRecognizer::Normal(ParserRecognizer { state });
-                f(&mut recognizer)
-            })
-        } else {
-            self.with_shared_greedy(|state| {
-                let mut recognizer = AnyParserRecognizer::Greedy(GreedyParserRecognizer { state });
-                f(&mut recognizer)
-            })
-        }
+        assert!(
+            self.uses_greedy(),
+            "with_greedy_recognizer requires greedy_lexeme_fallback"
+        );
+        self.with_shared_greedy(|state| {
+            let mut rec = GreedyParserRecognizer { state };
+            f(&mut rec)
+        })
     }
 
     pub fn get_bytes(&self) -> &[u8] {
