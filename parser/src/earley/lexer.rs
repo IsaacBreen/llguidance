@@ -59,6 +59,27 @@ pub enum LexerResult {
     Error,
 }
 
+#[derive(Debug)]
+pub enum GreedyLexerResult {
+    Lexeme(PreLexeme),
+    SpecialToken(StateID),
+    State(StateID, u8),
+    CheckpointStart(StateID, u8),
+    CheckpointResolved(StateID, u8),
+    Error,
+}
+
+impl From<LexerResult> for GreedyLexerResult {
+    fn from(result: LexerResult) -> Self {
+        match result {
+            LexerResult::Lexeme(pre) => Self::Lexeme(pre),
+            LexerResult::SpecialToken(state) => Self::SpecialToken(state),
+            LexerResult::State(state, byte) => Self::State(state, byte),
+            LexerResult::Error => Self::Error,
+        }
+    }
+}
+
 struct LexerPrecomputer<'a> {
     states: Vec<StateID>,
     lex: &'a mut Lexer,
@@ -259,6 +280,66 @@ impl Lexer {
         }
     }
 
+    /// Checkpoint-aware variant of [`Lexer::advance`]. The ordinary method is
+    /// intentionally left unchanged so grammars without greedy fallback retain
+    /// the original hot path.
+    #[inline(always)]
+    pub fn advance_greedy(
+        &mut self,
+        prev: StateID,
+        byte: u8,
+        enable_logging: bool,
+    ) -> GreedyLexerResult {
+        let state = self.dfa.transition(prev, byte);
+
+        if enable_logging {
+            let info = self.state_info(state);
+            debug!(
+                "lex: {:?} -{:?}-> {:?}, acpt={:?}/{:?}",
+                prev, byte as char, state, info.greedy_accepting, info.lazy_accepting
+            );
+        }
+
+        if state.is_dead() {
+            if !self.allowed_first_byte.is_allowed(byte as u32) {
+                return GreedyLexerResult::Error;
+            }
+            let info = self.dfa.state_desc(prev);
+            if info.greedy_accepting.is_some() {
+                GreedyLexerResult::Lexeme(PreLexeme {
+                    idx: MatchingLexemesIdx::GreedyAccepting(prev),
+                    byte: Some(byte),
+                    byte_next_row: true,
+                })
+            } else {
+                GreedyLexerResult::Error
+            }
+        } else if state.has_lowest_match() {
+            let info = self.dfa.state_desc(state);
+            assert!(info.lazy_accepting.is_some());
+            if info.has_special_token {
+                return GreedyLexerResult::SpecialToken(state);
+            }
+            GreedyLexerResult::Lexeme(PreLexeme {
+                idx: MatchingLexemesIdx::LazyAccepting(state),
+                byte: Some(byte),
+                byte_next_row: false,
+            })
+        } else {
+            let state_accepting = self.state_info(state).greedy_accepting.is_some();
+            if state_accepting {
+                // A later accepting endpoint supersedes any earlier fallback.
+                // This preserves ordinary global maximal munch even if the
+                // parser would later reject the longer lexeme.
+                GreedyLexerResult::CheckpointResolved(state, byte)
+            } else if self.state_info(prev).greedy_accepting.is_some() {
+                GreedyLexerResult::CheckpointStart(state, byte)
+            } else {
+                GreedyLexerResult::State(state, byte)
+            }
+        }
+    }
+
     pub fn lexemes_from_idx(&self, idx: MatchingLexemesIdx) -> &MatchingLexemes {
         match idx {
             MatchingLexemesIdx::Single(idx) => &self.spec.lexeme_spec(idx).single_set,
@@ -304,6 +385,13 @@ impl LexerResult {
     #[inline(always)]
     pub fn is_error(&self) -> bool {
         matches!(self, LexerResult::Error)
+    }
+}
+
+impl GreedyLexerResult {
+    #[inline(always)]
+    pub fn is_error(&self) -> bool {
+        matches!(self, GreedyLexerResult::Error)
     }
 }
 

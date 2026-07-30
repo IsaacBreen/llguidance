@@ -28,6 +28,10 @@ pub enum GrammarInit {
     Internal(Grammar, LexerSpec),
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// cbindgen:ignore
 pub const DEFAULT_CONTEXTUAL: bool = true;
 
@@ -54,6 +58,13 @@ pub struct LLGuidanceOptions {
     /// including nested sub-grammars.
     #[serde(default)]
     pub allow_initial_skip: bool,
+
+    /// Preserve earlier accepting greedy-lexeme boundaries and recover one
+    /// when the longer candidate can no longer extend the parse. This is
+    /// opt-in so existing grammars retain the original lexer hot path and
+    /// performance characteristics.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub greedy_lexeme_fallback: bool,
 }
 
 impl LLGuidanceOptions {
@@ -66,6 +77,9 @@ impl LLGuidanceOptions {
         }
         if other.allow_initial_skip {
             self.allow_initial_skip = true;
+        }
+        if other.greedy_lexeme_fallback {
+            self.greedy_lexeme_fallback = true;
         }
     }
 }

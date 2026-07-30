@@ -52,6 +52,9 @@ impl CompileCtx {
         if input.options.allow_initial_skip {
             res.builder.regex.spec.allow_initial_skip = true;
         }
+        if input.options.greedy_lexeme_fallback {
+            res.builder.regex.spec.greedy_lexeme_fallback = true;
+        }
 
         res.builder.check_limits()?;
 
