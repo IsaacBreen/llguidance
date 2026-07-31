@@ -36,6 +36,9 @@ use super::{
     regexvec::{LexemeSet, LexerStats},
 };
 
+mod greedy_replay;
+use greedy_replay::GreedyReplay;
+
 const TRACE: bool = false;
 const DEBUG: bool = true;
 pub(crate) const ITEM_TRACE: bool = false;
@@ -481,6 +484,7 @@ struct ParserState {
     // Cache for compute_bias - avoids recomputing identical masks when lexer state hasn't changed
     // (common in long lexemes, e.g. the interior of JSON strings)
     bias_cache: Option<BiasCache>,
+    greedy_replay: Option<Box<GreedyReplay>>,
 
     shared_box: Box<SharedState>,
 }
@@ -715,6 +719,10 @@ impl ParserState {
         } else {
             INVALID_TOKEN
         };
+        let greedy_replay = grammar
+            .lexer_spec()
+            .greedy_lexeme_fallback
+            .then(|| Box::new(GreedyReplay::default()));
         let mut r = ParserState {
             grammar,
             tok_env,
@@ -748,6 +756,7 @@ impl ParserState {
             trie_grammar_stack: 0,
             parser_error: None,
             bias_cache: None,
+            greedy_replay,
             shared_box: Box::new(SharedState {
                 lexer_opt: Some(lexer),
             }),
@@ -841,8 +850,10 @@ impl ParserState {
     fn compute_bias(&mut self, computer: &dyn BiasComputer, start: &[u8]) -> SimpleVob {
         let t0 = Instant::now();
 
-        // Check cache - only valid when start is empty (common case)
-        if start.is_empty() {
+        // A pending fallback depends on lexer history, not only the current DFA state.
+        let cacheable = start.is_empty()
+            && (self.greedy_replay.is_none() || !greedy_replay::has_checkpoint(self));
+        if cacheable {
             let curr_state = self.lexer_state();
             let has_pending = self.has_pending_lexeme_bytes();
             if let Some(ref cache) = self.bias_cache {
@@ -893,8 +904,7 @@ impl ParserState {
             set.allow_token(eos);
         }
 
-        // Update cache when start is empty
-        if start.is_empty() {
+        if cacheable {
             let curr_state = self.lexer_state();
             self.bias_cache = Some(BiasCache {
                 lexer_state: curr_state.lexer_state,
@@ -902,6 +912,8 @@ impl ParserState {
                 has_pending_lexeme_bytes: self.has_pending_lexeme_bytes(),
                 mask: set.clone(),
             });
+        } else {
+            self.bias_cache = None;
         }
 
         let d = t0.elapsed();
@@ -967,13 +979,11 @@ impl ParserState {
     }
 
     pub fn lexer_allows_eos(&mut self) -> bool {
-        if self.has_pending_lexeme_bytes() {
-            let lexer_state = self.lexer_state().lexer_state;
-            self.lexer_mut().allows_eos(lexer_state)
-        } else {
-            // empty lexemes are not allowed
-            false
+        if !self.has_pending_lexeme_bytes() {
+            return false;
         }
+        let lexer_state = self.lexer_state().lexer_state;
+        self.lexer_mut().allows_eos(lexer_state) || greedy_replay::accepting_allows_eos(self)
     }
 
     fn item_to_string(&self, idx: usize) -> String {
@@ -1025,8 +1035,14 @@ impl ParserState {
 
     #[inline(always)]
     fn pop_lexer_states(&mut self, n: usize) {
-        self.lexer_stack
-            .truncate(self.lexer_stack.len().saturating_sub(n));
+        let target = self.lexer_stack.len().saturating_sub(n);
+        if self.greedy_replay.is_some() && !self.scratch.definitive {
+            greedy_replay::restore_spec_to(self, target);
+        } else if self.greedy_replay.is_some() {
+            greedy_replay::truncate_history(self, target);
+        } else {
+            self.lexer_stack.truncate(target);
+        }
     }
 
     #[allow(dead_code)]
@@ -1105,10 +1121,17 @@ impl ParserState {
         );
 
         let new_len = self.byte_to_token_idx.len() - n_bytes;
+        if self.greedy_replay.is_some() {
+            greedy_replay::prepare_rollback(self, new_len);
+        }
 
         self.byte_to_token_idx.truncate(new_len);
         self.bytes.truncate(new_len);
-        self.lexer_stack.truncate(new_len + 1);
+        if self.greedy_replay.is_some() {
+            greedy_replay::truncate_history(self, new_len + 1);
+        } else {
+            self.lexer_stack.truncate(new_len + 1);
+        }
 
         self.row_infos.truncate(self.num_rows());
         self.token_idx = *self.byte_to_token_idx.last().unwrap_or(&0) as usize;
@@ -1574,11 +1597,24 @@ impl ParserState {
                     lexer_state: next_state,
                     byte: Some(byte),
                 });
+                greedy_replay::record_top_if_accepting(self);
                 true
             }
             LexerResult::Error => false,
-            LexerResult::Lexeme(pre_lexeme) => self.advance_parser(pre_lexeme),
-            LexerResult::SpecialToken(state) => self.special_pre_lexeme(state),
+            LexerResult::Lexeme(pre_lexeme) => {
+                let result = self.advance_parser(pre_lexeme);
+                if result {
+                    greedy_replay::record_top_if_accepting(self);
+                }
+                result
+            }
+            LexerResult::SpecialToken(state) => {
+                let result = self.special_pre_lexeme(state);
+                if result {
+                    greedy_replay::record_top_if_accepting(self);
+                }
+                result
+            }
         }
     }
 
@@ -1614,6 +1650,7 @@ impl ParserState {
     fn trie_finished_inner(&mut self) {
         // debug!("trie_finished: rows={} lexer={}", self.num_rows(), self.lexer_stack.len());
         assert!(!self.scratch.definitive);
+        greedy_replay::restore_all_spec(self);
         assert!(self.row_infos.len() <= self.num_rows());
 
         // cleanup excessive grammar items (perf)
@@ -1682,19 +1719,21 @@ impl ParserState {
             );
         }
 
-        assert!(self.backtrack_byte_count == 0);
+        let lexer_error = res.is_error();
+        assert_eq!(self.backtrack_byte_count, 0);
         if self.advance_lexer_or_parser(res, curr) {
             if let Some(b) = byte {
                 self.bytes.push(b);
             }
-            let bt = std::mem::take(&mut self.backtrack_byte_count);
-            if bt > 0 {
+            let backtrack = std::mem::take(&mut self.backtrack_byte_count);
+            if backtrack > 0 {
                 assert!(self.lexer_spec().has_stop);
-                // reset cache in case we hit the same length again in future
                 self.last_force_bytes_len = usize::MAX;
-                self.bytes.truncate(self.bytes.len() - bt);
+                self.bytes.truncate(self.bytes.len() - backtrack);
             }
-            (true, bt)
+            (true, backtrack)
+        } else if lexer_error && self.greedy_replay.is_some() {
+            greedy_replay::recover_definitive(self, byte, byte.is_none())
         } else {
             (false, 0)
         }
@@ -1721,7 +1760,9 @@ impl ParserState {
         let lex_state = self.lexer_state().lexer_state;
         let quick_res = self.lexer_mut().next_byte(lex_state);
         if let NextByte::ForcedByte(b) = quick_res {
-            return Some(b);
+            if self.greedy_replay.is_none() || !greedy_replay::has_checkpoint(self) {
+                return Some(b);
+            }
         }
 
         let slow_res = self.run_speculative("forced_byte", |state| {
@@ -1781,27 +1822,43 @@ impl ParserState {
     }
 
     fn restore_state(&mut self, state: SavedParserState) {
-        self.lexer_stack.truncate(state.lexer_stack_length);
+        let pop = self
+            .lexer_stack
+            .len()
+            .saturating_sub(state.lexer_stack_length);
+        self.pop_lexer_states(pop);
     }
 
     /// Advance the parser as if the current lexeme (if any)
     /// finished right here.
     /// Returns true if the parser was able to advance (or there were no pending bytes for a lexeme).
-    fn flush_lexer(&mut self) -> bool {
+    fn flush_lexer_raw(&mut self) -> bool {
         if !self.has_pending_lexeme_bytes() {
             return true;
         }
         let curr = self.lexer_state();
         let lex_result = self.lexer_mut().try_lexeme_end(curr.lexer_state);
         let prev_len = self.lexer_stack.len();
-        let r = self.advance_lexer_or_parser(lex_result, curr);
+        let result = self.advance_lexer_or_parser(lex_result, curr);
         if self.lexer_stack.len() != prev_len {
-            assert!(self.lexer_stack.len() == prev_len + 1);
+            assert_eq!(self.lexer_stack.len(), prev_len + 1);
             assert!(prev_len > 0);
             self.lexer_stack_flush_position = prev_len;
         }
-        assert!(self.backtrack_byte_count == 0);
-        r
+        assert_eq!(self.backtrack_byte_count, 0);
+        result
+    }
+
+    fn flush_lexer(&mut self) -> bool {
+        let result = self.flush_lexer_raw();
+        if result || self.greedy_replay.is_none() {
+            return result;
+        }
+        if self.scratch.definitive {
+            greedy_replay::recover_definitive(self, None, true).0
+        } else {
+            greedy_replay::recover_speculative(self, None, true)
+        }
     }
 
     pub fn scan_eos(&mut self) -> bool {
@@ -2052,8 +2109,7 @@ impl ParserState {
                     if !self.completion_index.contains_key(&start_pos) {
                         let mut m: HashMap<CSymIdx, Vec<usize>> = HashMap::default();
                         for i in self.rows[start_pos].item_indices() {
-                            let sym =
-                                self.grammar.sym_idx_dot(self.scratch.items[i].rhs_ptr());
+                            let sym = self.grammar.sym_idx_dot(self.scratch.items[i].rhs_ptr());
                             if sym != CSymIdx::NULL {
                                 m.entry(sym).or_default().push(i);
                             }
@@ -2702,6 +2758,9 @@ impl ParserRecognizer<'_> {
     pub fn metrics_mut(&mut self) -> &mut ParserMetrics {
         &mut self.state.metrics
     }
+    pub(crate) fn has_greedy_checkpoint(&mut self) -> bool {
+        greedy_replay::has_checkpoint(self.state)
+    }
 }
 
 pub trait BiasComputer: Send + Sync {
@@ -2774,13 +2833,17 @@ impl Recognizer for ParserRecognizer<'_> {
             }
         }
 
-        let r = self.state.advance_lexer_or_parser(res, curr);
+        let lexer_error = res.is_error();
+        let mut result = self.state.advance_lexer_or_parser(res, curr);
+        if !result && lexer_error && self.state.greedy_replay.is_some() {
+            result = greedy_replay::recover_speculative(self.state, Some(byte), false);
+        }
 
-        if ITEM_TRACE && !r {
+        if ITEM_TRACE && !result {
             self.state.trace_byte_stack.pop();
         }
 
-        r
+        result
     }
 
     fn save_stats(&mut self, nodes_walked: usize) {

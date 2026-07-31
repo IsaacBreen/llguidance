@@ -80,7 +80,7 @@ impl TokenizerSlice {
     }
 
     fn matches(&self, rec: &mut ParserRecognizer<'_>) -> bool {
-        if self.regex.is_empty() {
+        if self.regex.is_empty() || rec.has_greedy_checkpoint() {
             return false;
         }
         // set to at least 500
