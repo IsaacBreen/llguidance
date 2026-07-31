@@ -9,7 +9,7 @@ use crate::{
     toktrie::{SimpleVob, TokEnv, TokTrie, TokenId},
 };
 
-use super::parser::{BiasRecognizer, GreedyParserRecognizer, ITEM_TRACE};
+use super::parser::{GreedyParserRecognizer, ITEM_TRACE};
 
 struct TokenizerSlice {
     idx: usize,
@@ -79,7 +79,7 @@ impl TokenizerSlice {
         })
     }
 
-    fn matches<R: BiasRecognizer>(&self, rec: &mut R) -> bool {
+    fn matches<const GREEDY: bool>(&self, rec: &mut ParserRecognizer<'_, GREEDY>) -> bool {
         if self.regex.is_empty() || rec.has_greedy_checkpoint() {
             return false;
         }
@@ -96,7 +96,11 @@ impl TokenizerSlice {
         res
     }
 
-    fn trie_apply<R: BiasRecognizer>(&self, rec: &mut R, trg: &mut SimpleVob) {
+    fn trie_apply<const GREEDY: bool>(
+        &self,
+        rec: &mut ParserRecognizer<'_, GREEDY>,
+        trg: &mut SimpleVob,
+    ) {
         let t0 = crate::Instant::now();
         self.trie_with_children.add_bias(rec, trg, &[]);
         let us = t0.elapsed().as_micros() as usize;
@@ -105,7 +109,11 @@ impl TokenizerSlice {
 
     // possibly sets bits corresponding to matching tokens in the current slice
     // returns true if it did
-    fn apply<R: BiasRecognizer>(&self, rec: &mut R, trg: &mut SimpleVob) -> bool {
+    fn apply<const GREEDY: bool>(
+        &self,
+        rec: &mut ParserRecognizer<'_, GREEDY>,
+        trg: &mut SimpleVob,
+    ) -> bool {
         if self.matches(rec) {
             rec.stats_mut().slices_applied += 1;
             trg.or(&self.mask_trimmed);
@@ -366,7 +374,11 @@ impl SlicedBiasComputer {
 }
 
 impl SlicedBiasComputer {
-    fn compute_bias_with<R: BiasRecognizer>(&self, rec: &mut R, start: &[u8]) -> SimpleVob {
+    fn compute_bias_with<const GREEDY: bool>(
+        &self,
+        rec: &mut ParserRecognizer<'_, GREEDY>,
+        start: &[u8],
+    ) -> SimpleVob {
         let mut set = self.trie().alloc_token_set();
         let lexer_state = rec.lexer_state();
         if !self.top_slice.children.is_empty()

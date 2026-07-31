@@ -984,7 +984,8 @@ impl ParserState {
         }
         let lexer_state = self.lexer_state().lexer_state;
         self.lexer_mut().allows_eos(lexer_state)
-            || greedy_replay::with(self, |r| r.accepting_allows_eos())
+            || (self.shared_box.greedy_replay.is_some()
+                && greedy_replay::with(self, |r| r.accepting_allows_eos()))
     }
 
     fn item_to_string(&self, idx: usize) -> String {
@@ -1139,15 +1140,69 @@ impl ParserState {
         Ok(())
     }
 
-    pub fn validate_tokens(&mut self, tokens: &[TokenId]) -> usize {
+    pub fn validate_tokens<const GREEDY: bool>(&mut self, tokens: &[TokenId]) -> usize {
         self.assert_definitive();
         self.run_speculative("validate_tokens", |state| {
             state.scratch.log_override = true;
-            if state.shared_box.greedy_replay.is_none() {
-                validate_tokens_with(&mut ParserRecognizer::<false> { state }, tokens)
-            } else {
-                validate_tokens_with(&mut ParserRecognizer::<true> { state }, tokens)
+            let mut applied_idx = state.byte_to_token_idx.len();
+            let tok_env = state.tok_env.clone();
+            let trie = tok_env.tok_trie();
+            let eos = trie.eos_token();
+            let mut recog = ParserRecognizer::<GREEDY> { state };
+            for (tidx, &tok) in tokens.iter().enumerate() {
+                let state = &mut recog.state;
+                if tok == eos {
+                    if applied_idx == state.bytes.len() && state.is_accepting_inner() {
+                        return tidx + 1;
+                    } else {
+                        return tidx;
+                    }
+                }
+
+                if applied_idx >= state.bytes.len() {
+                    let saved_len = state.lexer_stack.len();
+
+                    if let Some(idx) = state.flush_and_check_numeric(tok) {
+                        let numeric_bytes = trie.decode_as_special(tok);
+                        let ok = state.add_numeric_token(idx, &numeric_bytes);
+                        assert!(ok.is_ok());
+                        continue; // next token please
+                    }
+
+                    let pop = state.lexer_stack.len() - saved_len;
+                    recog.pop_bytes(pop);
+                }
+
+                let token_bytes = trie.decode_raw(&[tok]);
+
+                let token_bytes = if applied_idx < recog.state.bytes.len()
+                    && recog.state.bytes[applied_idx] == TokTrie::SPECIAL_TOKEN_MARKER
+                {
+                    trie.decode_as_special(tok)
+                } else {
+                    token_bytes
+                };
+
+                for &b in &token_bytes {
+                    if applied_idx < recog.state.bytes.len() {
+                        if recog.state.bytes[applied_idx] == b {
+                            applied_idx += 1;
+                        } else {
+                            return tidx;
+                        }
+                    } else {
+                        // never push FF
+                        if b != TokTrie::SPECIAL_TOKEN_MARKER && recog.try_push_byte(b) {
+                            // normal path
+                            continue;
+                        } else {
+                            return tidx;
+                        }
+                    }
+                }
             }
+
+            tokens.len() // all ok!
         })
     }
 
@@ -1432,14 +1487,14 @@ impl ParserState {
     /// force_bytes() forces bytes into the parser, definitively.
     /// They must be, at each point, the only bytes allowed by
     /// the parser.  force_bytes() returns a 'Vec' of the bytes pushed.
-    pub fn force_bytes(&mut self) {
+    pub fn force_bytes<const GREEDY: bool>(&mut self) {
         self.assert_definitive();
         if !self.needs_force_bytes() {
             return;
         }
         trace!("force_bytes lexer_stack {}", self.lexer_stack.len());
         self.with_items_limit(self.limits.step_max_items, "ff_tokens", |s| {
-            while let Some(b) = s.forced_byte() {
+            while let Some(b) = s.forced_byte::<GREEDY>() {
                 debug!("  forced: {:?} 0x{:x}", b as char, b);
                 if b == TokTrie::SPECIAL_TOKEN_MARKER {
                     assert!(!s.has_pending_lexeme_bytes());
@@ -1472,7 +1527,9 @@ impl ParserState {
                                 all_ok = false;
                                 break;
                             }
-                            greedy_replay::with(s, |r| r.forced_byte_committed(b));
+                            if GREEDY {
+                                greedy_replay::with(s, |r| r.forced_byte_committed(b));
+                            }
                         }
 
                         if !all_ok {
@@ -1498,7 +1555,9 @@ impl ParserState {
                     debug!("  force_bytes reject {}", b as char);
                     break;
                 }
-                greedy_replay::with(s, |r| r.forced_byte_committed(b));
+                if GREEDY {
+                    greedy_replay::with(s, |r| r.forced_byte_committed(b));
+                }
             }
         });
         self.assert_definitive();
@@ -1619,12 +1678,12 @@ impl ParserState {
 
     fn run_speculative<T>(&mut self, lbl: &str, f: impl FnOnce(&mut Self) -> T) -> T {
         self.trie_started_inner(lbl);
-        let result = f(self);
+        let r = f(self);
         if self.shared_box.greedy_replay.is_some() {
             greedy_replay::with(self, |r| r.restore_all_spec());
         }
         self.trie_finished_inner();
-        result
+        r
     }
 
     fn is_accepting_inner(&mut self) -> bool {
@@ -1664,7 +1723,7 @@ impl ParserState {
             );
         }
 
-        assert_eq!(self.backtrack_byte_count, 0);
+        assert!(self.backtrack_byte_count == 0);
         let lexer_error = res.is_error();
         if self.advance_lexer_or_parser(res, curr) {
             if self.shared_box.greedy_replay.is_some() {
@@ -1673,13 +1732,14 @@ impl ParserState {
             if let Some(b) = byte {
                 self.bytes.push(b);
             }
-            let backtrack = std::mem::take(&mut self.backtrack_byte_count);
-            if backtrack > 0 {
+            let bt = std::mem::take(&mut self.backtrack_byte_count);
+            if bt > 0 {
                 assert!(self.lexer_spec().has_stop);
+                // reset cache in case we hit the same length again in future
                 self.last_force_bytes_len = usize::MAX;
-                self.bytes.truncate(self.bytes.len() - backtrack);
+                self.bytes.truncate(self.bytes.len() - bt);
             }
-            (true, backtrack)
+            (true, bt)
         } else if lexer_error && self.shared_box.greedy_replay.is_some() {
             greedy_replay::with(self, |r| r.recover::<true>(byte, byte.is_none()))
         } else {
@@ -1696,7 +1756,7 @@ impl ParserState {
     /// forced_byte() finds the unique byte allowed by the
     /// parser at this point, and returns it.  If there is
     /// no such byte, forced_byte() returns 'None'.
-    fn forced_byte(&mut self) -> Option<u8> {
+    fn forced_byte<const GREEDY: bool>(&mut self) -> Option<u8> {
         if self.is_accepting() {
             debug!("  in accept state, not forcing");
             return None;
@@ -1708,18 +1768,59 @@ impl ParserState {
         let lex_state = self.lexer_state().lexer_state;
         let quick_res = self.lexer_mut().next_byte(lex_state);
         if let NextByte::ForcedByte(b) = quick_res {
-            if self.shared_box.greedy_replay.is_none() || !greedy_replay::has_checkpoint(self) {
+            if !GREEDY || !greedy_replay::has_checkpoint(self) {
                 return Some(b);
             }
         }
 
-        self.run_speculative("forced_byte", |state| {
-            if state.shared_box.greedy_replay.is_none() {
-                forced_byte_with(&mut ParserRecognizer::<false> { state }, quick_res)
-            } else {
-                forced_byte_with(&mut ParserRecognizer::<true> { state }, quick_res)
+        let slow_res = self.run_speculative("forced_byte", |state| {
+            let mut r = ParserRecognizer::<GREEDY> { state };
+
+            // if we've got two byte hint from the lexer, try both bytes
+            if let NextByte::SomeBytes2([a, b]) = quick_res {
+                if r.try_push_byte(a) {
+                    r.pop_bytes(1);
+                    if r.try_push_byte(b) {
+                        r.pop_bytes(1);
+                        //r.state.perf_counters.forced_byte_miss.record(t0.elapsed());
+                        return None;
+                    }
+                }
             }
-        })
+
+            // let alpha = r.state.lexer().dfa.alpha().unique_bytes();
+
+            // otherwise, start iterating from any hint from the lexer,
+            // otherwise from ' '
+            let b0 = quick_res.some_bytes().first().cloned().unwrap_or(b' ');
+            let mut b = b0;
+            let mut byte_sym = None;
+            loop {
+                if r.try_push_byte(b) {
+                    r.pop_bytes(1);
+                    // debug!("  forced: {:?}", b as char);
+                    if byte_sym.is_some() {
+                        // debug!("  forced multiple");
+                        return None; // more than one option
+                    } else {
+                        byte_sym = Some(b);
+                    }
+                }
+                b = b.wrapping_add(1);
+                if b == b0 {
+                    break;
+                }
+            }
+            byte_sym
+        });
+
+        // if quick_res.is_some() {
+        //     assert_eq!(quick_res, slow_res);
+        // } else if slow_res.is_none() {
+        //     self.perf_counters.forced_byte_miss.record(t0.elapsed());
+        // }
+
+        slow_res
     }
 
     /// Advance the parser as if the current lexeme (if any)
@@ -2656,41 +2757,8 @@ impl<const GREEDY: bool> ParserRecognizer<'_, GREEDY> {
     pub fn metrics_mut(&mut self) -> &mut ParserMetrics {
         &mut self.state.metrics
     }
-}
-
-pub(crate) trait BiasRecognizer: Recognizer {
-    fn lexer_mut(&mut self) -> &mut Lexer;
-    fn lexer_state(&self) -> StateID;
-    fn stats_mut(&mut self) -> &mut ParserStats;
-    fn metrics_mut(&mut self) -> &mut ParserMetrics;
-    fn has_greedy_checkpoint(&self) -> bool;
-}
-
-trait StateRecognizer: Recognizer {
-    fn state_mut(&mut self) -> &mut ParserState;
-}
-
-impl<const GREEDY: bool> BiasRecognizer for ParserRecognizer<'_, GREEDY> {
-    fn lexer_mut(&mut self) -> &mut Lexer {
-        self.state.lexer_mut()
-    }
-    fn lexer_state(&self) -> StateID {
-        self.state.lexer_state().lexer_state
-    }
-    fn stats_mut(&mut self) -> &mut ParserStats {
-        &mut self.state.stats
-    }
-    fn metrics_mut(&mut self) -> &mut ParserMetrics {
-        &mut self.state.metrics
-    }
-    fn has_greedy_checkpoint(&self) -> bool {
+    pub(crate) fn has_greedy_checkpoint(&self) -> bool {
         GREEDY && greedy_replay::has_checkpoint(&*self.state)
-    }
-}
-
-impl<const GREEDY: bool> StateRecognizer for ParserRecognizer<'_, GREEDY> {
-    fn state_mut(&mut self) -> &mut ParserState {
-        self.state
     }
 }
 
@@ -2761,91 +2829,6 @@ impl<const GREEDY: bool> Recognizer for ParserRecognizer<'_, GREEDY> {
     fn save_stats(&mut self, nodes_walked: usize) {
         self.state.stats.trie_nodes_walked += nodes_walked;
     }
-}
-
-fn validate_tokens_with<R: StateRecognizer>(recognizer: &mut R, tokens: &[TokenId]) -> usize {
-    let mut applied_idx = recognizer.state_mut().byte_to_token_idx.len();
-    let tok_env = recognizer.state_mut().tok_env.clone();
-    let trie = tok_env.tok_trie();
-    let eos = trie.eos_token();
-
-    for (token_idx, &token) in tokens.iter().enumerate() {
-        if token == eos {
-            let state = recognizer.state_mut();
-            return token_idx
-                + usize::from(applied_idx == state.bytes.len() && state.is_accepting_inner());
-        }
-
-        if applied_idx >= recognizer.state_mut().bytes.len() {
-            let saved_len = recognizer.state_mut().lexer_stack.len();
-            let numeric = recognizer.state_mut().flush_and_check_numeric(token);
-            if let Some(idx) = numeric {
-                let numeric_bytes = trie.decode_as_special(token);
-                recognizer
-                    .state_mut()
-                    .add_numeric_token(idx, &numeric_bytes)
-                    .unwrap();
-                continue;
-            }
-            let pop = recognizer.state_mut().lexer_stack.len() - saved_len;
-            recognizer.pop_bytes(pop);
-        }
-
-        let token_bytes = trie.decode_raw(&[token]);
-        let token_bytes = {
-            let state = recognizer.state_mut();
-            if applied_idx < state.bytes.len()
-                && state.bytes[applied_idx] == TokTrie::SPECIAL_TOKEN_MARKER
-            {
-                trie.decode_as_special(token)
-            } else {
-                token_bytes
-            }
-        };
-
-        for &byte in &token_bytes {
-            let state = recognizer.state_mut();
-            if applied_idx < state.bytes.len() {
-                if state.bytes[applied_idx] != byte {
-                    return token_idx;
-                }
-                applied_idx += 1;
-            } else if byte == TokTrie::SPECIAL_TOKEN_MARKER || !recognizer.try_push_byte(byte) {
-                return token_idx;
-            }
-        }
-    }
-    tokens.len()
-}
-
-fn forced_byte_with<R: Recognizer>(recognizer: &mut R, quick: NextByte) -> Option<u8> {
-    if let NextByte::SomeBytes2([a, b]) = quick {
-        if recognizer.try_push_byte(a) {
-            recognizer.pop_bytes(1);
-            if recognizer.try_push_byte(b) {
-                recognizer.pop_bytes(1);
-                return None;
-            }
-        }
-    }
-
-    let first = quick.some_bytes().first().copied().unwrap_or(b' ');
-    let mut byte = first;
-    let mut forced = None;
-    loop {
-        if recognizer.try_push_byte(byte) {
-            recognizer.pop_bytes(1);
-            if forced.is_some() {
-                return None;
-            }
-            forced = Some(byte);
-        }
-        byte = byte.wrapping_add(1);
-        if byte == first {
-            break;
-        }
-    }
-    forced
 }
 
 fn item_to_string(g: &CGrammar, item: &Item, param: ParamValue) -> String {
@@ -2986,7 +2969,13 @@ impl Parser {
         } else {
             let t0 = Instant::now();
             let prev_len = self.currently_forced_bytes().len();
-            self.with_shared(|state| state.force_bytes());
+            self.with_shared(|state| {
+                if state.shared_box.greedy_replay.is_none() {
+                    state.force_bytes::<false>();
+                } else {
+                    state.force_bytes::<true>();
+                }
+            });
             let r = self.currently_forced_bytes();
             if r.len() > prev_len {
                 self.state.perf_counters.force_bytes.record(t0.elapsed());
@@ -3028,10 +3017,10 @@ impl Parser {
     fn with_shared<T>(&mut self, f: impl FnOnce(&mut ParserState) -> T) -> T {
         let mut shared = self.shared.lock().unwrap();
         std::mem::swap(&mut self.state.shared_box.lexer_opt, &mut shared.lexer_opt);
-        let result = f(&mut self.state);
+        let r = f(&mut self.state);
         std::mem::swap(&mut self.state.shared_box.lexer_opt, &mut shared.lexer_opt);
         assert!(shared.lexer_opt.is_some());
-        result
+        r
     }
 
     pub fn rollback(&mut self, n_bytes: usize) -> Result<()> {
@@ -3042,7 +3031,11 @@ impl Parser {
     /// Returns how many tokens can be applied.
     pub fn validate_tokens(&mut self, tokens: &[TokenId]) -> usize {
         self.with_shared(|state| {
-            let r = state.validate_tokens(tokens);
+            let r = if state.shared_box.greedy_replay.is_none() {
+                state.validate_tokens::<false>(tokens)
+            } else {
+                state.validate_tokens::<true>(tokens)
+            };
             debug!(
                 "validate_tokens: {} -> {}/{}",
                 state.tok_env.tok_trie().tokens_dbg(tokens),

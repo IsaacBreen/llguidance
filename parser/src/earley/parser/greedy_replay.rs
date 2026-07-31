@@ -9,17 +9,36 @@ struct Snapshot {
 }
 
 #[derive(Clone)]
+struct Shadow {
+    source: usize,
+    snapshot: Box<Snapshot>,
+}
+
+#[derive(Clone, Copy)]
+enum Origin {
+    Current,
+    Shadow(usize),
+}
+
+struct Attempt {
+    origin: Origin,
+    previous: Box<Snapshot>,
+    prefix: usize,
+    existing: usize,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
 struct Undo {
     trigger: usize,
     previous: Box<Snapshot>,
-    shadow_promotion: bool,
+    shadow_source: Option<usize>,
 }
 
 #[derive(Clone, Default)]
 pub(super) struct GreedyReplay {
     accepting: Vec<usize>,
-    shadow: Option<Box<Snapshot>>,
-    shadow_source: Option<usize>,
+    shadow: Option<Shadow>,
     spec_undo: Option<Undo>,
     promotion_undo: Option<Undo>,
 }
@@ -30,11 +49,7 @@ pub(super) struct Context<'a> {
 }
 
 pub(super) fn with<T>(state: &mut ParserState, f: impl FnOnce(&mut Context<'_>) -> T) -> T {
-    let mut replay = *state
-        .shared_box
-        .greedy_replay
-        .take()
-        .expect("greedy replay on ordinary parser");
+    let mut replay = *state.shared_box.greedy_replay.take().unwrap();
     let result = f(&mut Context {
         state,
         replay: &mut replay,
@@ -58,7 +73,6 @@ fn with_snapshot<T>(
 
 impl Context<'_> {
     fn snapshot(&mut self) -> Snapshot {
-        debug_assert!(self.state.shared_box.greedy_replay.is_none());
         let shared = std::mem::take(&mut self.state.shared_box);
         let state = self.state.clone();
         self.state.shared_box = shared;
@@ -74,7 +88,7 @@ impl Context<'_> {
         *self.replay = snapshot.replay;
     }
 
-    fn swap_snapshot(&mut self, mut snapshot: Box<Snapshot>) -> Box<Snapshot> {
+    fn swap(&mut self, mut snapshot: Box<Snapshot>) -> Box<Snapshot> {
         let shared = std::mem::take(&mut self.state.shared_box);
         std::mem::swap(self.state, &mut snapshot.state);
         self.state.shared_box = shared;
@@ -82,33 +96,9 @@ impl Context<'_> {
         snapshot
     }
 
-    fn latest_accepting(&mut self) -> Option<(usize, PreLexeme, Vec<u8>)> {
-        let top = self.state.lexer_state();
-        if !self.state.scratch.definitive {
-            let floor = self
-                .state
-                .trie_lexer_stack
-                .min(self.state.lexer_stack.len());
-            for idx in (floor..self.state.lexer_stack.len()).rev() {
-                let item = self.state.lexer_stack[idx];
-                if item.row_idx != top.row_idx {
-                    break;
-                }
-                if let LexerResult::Lexeme(pre) =
-                    self.state.lexer_mut().try_lexeme_end(item.lexer_state)
-                {
-                    let bytes = self.state.lexer_stack[idx + 1..]
-                        .iter()
-                        .map(|state| state.byte)
-                        .collect::<Option<_>>()?;
-                    return Some((idx, pre, bytes));
-                }
-            }
-        }
-
-        let idx = *self.replay.accepting.last()?;
+    fn checkpoint(&mut self, idx: usize, row: u32) -> Option<(usize, PreLexeme, Vec<u8>)> {
         let item = *self.state.lexer_stack.get(idx)?;
-        if item.row_idx != top.row_idx {
+        if item.row_idx != row {
             return None;
         }
         let LexerResult::Lexeme(pre) = self.state.lexer_mut().try_lexeme_end(item.lexer_state)
@@ -122,6 +112,25 @@ impl Context<'_> {
         Some((idx, pre, bytes))
     }
 
+    fn latest_accepting(&mut self) -> Option<(usize, PreLexeme, Vec<u8>)> {
+        let row = self.state.lexer_state().row_idx;
+        if !self.state.scratch.definitive {
+            let floor = self
+                .state
+                .trie_lexer_stack
+                .min(self.state.lexer_stack.len());
+            for idx in (floor..self.state.lexer_stack.len()).rev() {
+                if self.state.lexer_stack[idx].row_idx != row {
+                    break;
+                }
+                if let Some(checkpoint) = self.checkpoint(idx, row) {
+                    return Some(checkpoint);
+                }
+            }
+        }
+        self.checkpoint(*self.replay.accepting.last()?, row)
+    }
+
     pub(super) fn truncate_lexer(&mut self, target: usize) {
         self.state.lexer_stack.truncate(target);
         while self
@@ -132,23 +141,26 @@ impl Context<'_> {
         {
             self.replay.accepting.pop();
         }
-        if self.replay.shadow_source.is_some_and(|idx| idx >= target) {
+        if self
+            .replay
+            .shadow
+            .as_ref()
+            .is_some_and(|shadow| shadow.source >= target)
+        {
             self.replay.shadow = None;
-            self.replay.shadow_source = None;
         }
     }
 
     pub(super) fn record_top_if_accepting(&mut self) {
         let idx = self.state.lexer_stack.len() - 1;
-        let lexer_state = self.state.lexer_stack[idx].lexer_state;
+        let state = self.state.lexer_stack[idx].lexer_state;
         if matches!(
-            self.state.lexer_mut().try_lexeme_end(lexer_state),
+            self.state.lexer_mut().try_lexeme_end(state),
             LexerResult::Lexeme(_)
         ) && self.replay.accepting.last() != Some(&idx)
         {
             self.replay.accepting.push(idx);
             self.replay.shadow = None;
-            self.replay.shadow_source = None;
         }
     }
 
@@ -165,17 +177,16 @@ impl Context<'_> {
         self.state.lexer_stack_flush_position = 0;
     }
 
-    fn restore_shadow(&mut self, previous: Box<Snapshot>) {
+    fn restore_shadow(&mut self, previous: Box<Snapshot>, source: usize) {
         self.finish_shadow_speculation();
-        let shadow = self.swap_snapshot(previous);
-        self.replay.shadow = Some(shadow);
+        let snapshot = self.swap(previous);
+        self.replay.shadow = Some(Shadow { source, snapshot });
     }
 
     fn restore_undo(&mut self, undo: Undo) {
-        if undo.shadow_promotion {
-            self.restore_shadow(undo.previous);
-        } else {
-            self.restore(*undo.previous);
+        match undo.shadow_source {
+            Some(source) => self.restore_shadow(undo.previous, source),
+            None => self.restore(*undo.previous),
         }
     }
 
@@ -207,7 +218,6 @@ impl Context<'_> {
         if result.is_error() {
             return self.recover::<DEFINITIVE>(Some(byte), false);
         }
-
         let is_state = matches!(result, LexerResult::State(_, _));
         if !self.state.advance_lexer_or_parser(result, current) {
             return (false, 0);
@@ -218,7 +228,6 @@ impl Context<'_> {
         if !DEFINITIVE {
             return (true, 0);
         }
-
         self.state.bytes.push(byte);
         let backtrack = std::mem::take(&mut self.state.backtrack_byte_count);
         if backtrack > 0 {
@@ -235,44 +244,40 @@ impl Context<'_> {
         self.state.flush_lexer_raw() || self.recover::<DEFINITIVE>(None, true).0
     }
 
-    fn replay_bytes<const DEFINITIVE: bool>(
-        &mut self,
-        bytes: &[u8],
-        existing: usize,
-        prefix: usize,
-        mapping: &[u32],
-    ) -> (bool, usize) {
-        let mut backtrack = 0;
-        for (offset, &byte) in bytes.iter().enumerate() {
-            let (ok, bt) = self.try_push::<DEFINITIVE>(byte);
-            if !ok || bt > 0 {
-                return (false, bt);
+    fn replay_bytes<const DEFINITIVE: bool>(&mut self, attempt: &Attempt) -> (bool, usize) {
+        for (offset, &byte) in attempt.bytes.iter().enumerate() {
+            let (ok, backtrack) = self.try_push::<DEFINITIVE>(byte);
+            if !ok || backtrack > 0 {
+                return (false, backtrack);
             }
-            backtrack = bt;
-            if DEFINITIVE && offset < existing {
-                if let Some(&token_idx) = mapping.get(prefix + offset) {
-                    self.state.byte_to_token_idx.push(token_idx);
+            if DEFINITIVE && offset < attempt.existing {
+                if let Some(&token) = attempt
+                    .previous
+                    .state
+                    .byte_to_token_idx
+                    .get(attempt.prefix + offset)
+                {
+                    self.state.byte_to_token_idx.push(token);
                 }
             }
         }
-        (true, backtrack)
+        (true, 0)
     }
 
     fn install_undo<const DEFINITIVE: bool>(
         &mut self,
         previous: Box<Snapshot>,
-        shadow_promotion: bool,
+        shadow_source: Option<usize>,
         added_byte: bool,
     ) {
-        let trigger = if DEFINITIVE {
-            previous.state.bytes.len() + usize::from(added_byte)
-        } else {
-            self.state.lexer_stack.len()
-        };
         let undo = Undo {
-            trigger,
+            trigger: if DEFINITIVE {
+                previous.state.bytes.len() + usize::from(added_byte)
+            } else {
+                self.state.lexer_stack.len()
+            },
             previous,
-            shadow_promotion,
+            shadow_source,
         };
         if DEFINITIVE {
             self.replay.promotion_undo = Some(undo);
@@ -287,100 +292,77 @@ impl Context<'_> {
         self.state.bias_cache = None;
     }
 
-    fn recover_shadow<const DEFINITIVE: bool>(
-        &mut self,
-        byte: Option<u8>,
-        flush_end: bool,
-    ) -> Option<(bool, usize)> {
+    fn restore_failed(&mut self, attempt: Attempt) {
+        match attempt.origin {
+            Origin::Current => self.restore(*attempt.previous),
+            Origin::Shadow(source) => {
+                let snapshot = self.swap(attempt.previous);
+                self.replay.shadow = Some(Shadow { source, snapshot });
+            }
+        }
+    }
+
+    fn prepare_shadow<const DEFINITIVE: bool>(&mut self) -> Option<Attempt> {
+        let Shadow { source, snapshot } = self.replay.shadow.take()?;
         let floor = self
             .state
             .trie_lexer_stack
             .min(self.state.lexer_stack.len());
         let end = self.state.lexer_stack.len();
-        let source = self.replay.shadow_source;
-        let shadow = self.replay.shadow.take()?;
-        if DEFINITIVE {
-            self.replay.shadow_source = None;
-        }
-        let previous = self.swap_snapshot(shadow);
+        let previous = self.swap(snapshot);
         if !DEFINITIVE {
             self.state.trie_started_inner("greedy_shadow");
         }
-
-        let (prefix, existing, bytes, mapping) = if DEFINITIVE {
+        let (prefix, existing, bytes) = if DEFINITIVE {
             let prefix = self.state.bytes.len();
             if prefix > previous.state.bytes.len() {
-                let shadow = self.swap_snapshot(previous);
-                self.replay.shadow = Some(shadow);
-                self.replay.shadow_source = source;
-                return Some((false, 0));
+                self.restore_failed(Attempt {
+                    origin: Origin::Shadow(source),
+                    previous,
+                    prefix: 0,
+                    existing: 0,
+                    bytes: Vec::new(),
+                });
+                return None;
             }
             let bytes = previous.state.bytes[prefix..].to_vec();
             let existing = bytes.len();
-            let mapping = previous.state.byte_to_token_idx.clone();
+            let mapping = &previous.state.byte_to_token_idx;
             let mapped = prefix.min(mapping.len());
             if self.state.byte_to_token_idx.len() < mapped {
                 self.state
                     .byte_to_token_idx
                     .extend_from_slice(&mapping[self.state.byte_to_token_idx.len()..mapped]);
             }
-            (prefix, existing, bytes, mapping)
+            (prefix, existing, bytes)
         } else {
             let Some(bytes) = previous.state.lexer_stack[floor..end]
                 .iter()
                 .map(|state| state.byte)
-                .collect::<Option<Vec<_>>>()
+                .collect::<Option<_>>()
             else {
-                self.restore_shadow(previous);
-                return Some((false, 0));
+                self.restore_shadow(previous, source);
+                return None;
             };
-            (0, 0, bytes, Vec::new())
+            (0, 0, bytes)
         };
-
-        let (mut ok, mut backtrack) =
-            self.replay_bytes::<DEFINITIVE>(&bytes, existing, prefix, &mapping);
-        if ok {
-            if let Some(byte) = byte {
-                (ok, backtrack) = self.try_push::<DEFINITIVE>(byte);
-            }
-        }
-        if ok && backtrack == 0 && flush_end {
-            ok = self.flush::<DEFINITIVE>();
-        }
-        if !ok || backtrack > 0 {
-            if !DEFINITIVE {
-                self.finish_shadow_speculation();
-            }
-            let shadow = self.swap_snapshot(previous);
-            self.replay.shadow = Some(shadow);
-            self.replay.shadow_source = source;
-            return Some((false, backtrack));
-        }
-
-        self.install_undo::<DEFINITIVE>(previous, !DEFINITIVE, byte.is_some());
-        Some((true, backtrack))
+        Some(Attempt {
+            origin: Origin::Shadow(source),
+            previous,
+            prefix,
+            existing,
+            bytes,
+        })
     }
 
-    fn recover_current<const DEFINITIVE: bool>(
-        &mut self,
-        byte: Option<u8>,
-        flush_end: bool,
-    ) -> (bool, usize) {
-        let Some((checkpoint, mut pre, mut bytes)) = self.latest_accepting() else {
-            return (false, 0);
-        };
+    fn prepare_current<const DEFINITIVE: bool>(&mut self, byte: Option<u8>) -> Option<Attempt> {
+        let (checkpoint, mut pre, mut bytes) = self.latest_accepting()?;
         let existing = bytes.len();
         bytes.extend(byte);
-        let Some((&first, rest)) = bytes.split_first() else {
-            return (false, 0);
-        };
-
+        let (&first, rest) = bytes.split_first()?;
         let previous = Box::new(self.snapshot());
         let prefix = if DEFINITIVE {
-            let Some(prefix) = self.state.bytes.len().checked_sub(existing) else {
-                self.restore(*previous);
-                return (false, 0);
-            };
+            let prefix = self.state.bytes.len().checked_sub(existing)?;
             self.state.bytes.truncate(prefix);
             self.state
                 .byte_to_token_idx
@@ -393,50 +375,32 @@ impl Context<'_> {
         } else {
             0
         };
-
         self.truncate_lexer(checkpoint + 1);
         self.state.lexer_stack_top_eos = false;
         self.state.lexer_stack_flush_position = 0;
         self.state.bias_cache = None;
-
         pre.byte = Some(first);
         pre.byte_next_row = true;
-        let mut ok = self.state.advance_parser(pre);
-        if ok {
-            self.record_top_if_accepting();
-            if DEFINITIVE {
-                self.state.bytes.push(first);
-                if existing > 0 {
-                    if let Some(&token_idx) = previous.state.byte_to_token_idx.get(prefix) {
-                        self.state.byte_to_token_idx.push(token_idx);
-                    }
+        if !self.state.advance_parser(pre) {
+            self.restore(*previous);
+            return None;
+        }
+        self.record_top_if_accepting();
+        if DEFINITIVE {
+            self.state.bytes.push(first);
+            if existing > 0 {
+                if let Some(&token) = previous.state.byte_to_token_idx.get(prefix) {
+                    self.state.byte_to_token_idx.push(token);
                 }
             }
         }
-
-        let (replay_ok, mut backtrack) = if ok {
-            self.replay_bytes::<DEFINITIVE>(
-                rest,
-                existing.saturating_sub(1),
-                prefix + 1,
-                &previous.state.byte_to_token_idx,
-            )
-        } else {
-            (false, 0)
-        };
-        ok &= replay_ok;
-        if ok && backtrack == 0 && flush_end {
-            ok = self.flush::<DEFINITIVE>();
-        }
-
-        if ok && backtrack == 0 {
-            self.install_undo::<DEFINITIVE>(previous, false, byte.is_some());
-            (true, backtrack)
-        } else {
-            self.restore(*previous);
-            backtrack = 0;
-            (false, backtrack)
-        }
+        Some(Attempt {
+            origin: Origin::Current,
+            previous,
+            prefix: prefix + 1,
+            existing: existing.saturating_sub(1),
+            bytes: rest.to_vec(),
+        })
     }
 
     pub(super) fn recover<const DEFINITIVE: bool>(
@@ -444,41 +408,49 @@ impl Context<'_> {
         byte: Option<u8>,
         flush_end: bool,
     ) -> (bool, usize) {
-        self.recover_shadow::<DEFINITIVE>(byte, flush_end)
-            .unwrap_or_else(|| self.recover_current::<DEFINITIVE>(byte, flush_end))
+        let from_shadow = self.replay.shadow.is_some();
+        let Some(attempt) = (if from_shadow {
+            self.prepare_shadow::<DEFINITIVE>()
+        } else {
+            self.prepare_current::<DEFINITIVE>(byte)
+        }) else {
+            return (false, 0);
+        };
+        let (mut ok, mut backtrack) = self.replay_bytes::<DEFINITIVE>(&attempt);
+        if ok && from_shadow {
+            if let Some(byte) = byte {
+                (ok, backtrack) = self.try_push::<DEFINITIVE>(byte);
+            }
+        }
+        if ok && backtrack == 0 && flush_end {
+            ok = self.flush::<DEFINITIVE>();
+        }
+        if !ok || backtrack > 0 {
+            if !DEFINITIVE && from_shadow {
+                self.finish_shadow_speculation();
+            }
+            self.restore_failed(attempt);
+            return (false, backtrack);
+        }
+        let shadow_source = match attempt.origin {
+            Origin::Shadow(source) if !DEFINITIVE => Some(source),
+            _ => None,
+        };
+        self.install_undo::<DEFINITIVE>(attempt.previous, shadow_source, byte.is_some());
+        (true, backtrack)
     }
 
-    fn advance_shadow_token(&mut self, tok_bytes: &[u8], tok_id: TokenId) {
-        let source = self.replay.shadow_source;
+    fn update_shadow(&mut self, f: impl FnOnce(&mut ParserState) -> bool) {
         let Some(mut shadow) = self.replay.shadow.take() else {
             return;
         };
-        let result = with_snapshot(self.state, &mut shadow, |state| {
-            state.apply_token(tok_bytes, tok_id)
-        });
-        if matches!(result, Ok(0)) {
-            shadow.state.token_idx += 1;
+        if with_snapshot(self.state, &mut shadow.snapshot, f) {
             self.replay.shadow = Some(shadow);
         }
-        self.replay.shadow_source = source;
-    }
-
-    fn advance_shadow_byte(&mut self, byte: u8) {
-        let source = self.replay.shadow_source;
-        let Some(mut shadow) = self.replay.shadow.take() else {
-            return;
-        };
-        let result = with_snapshot(self.state, &mut shadow, |state| {
-            state.try_push_byte_definitive(Some(byte))
-        });
-        if result == (true, 0) {
-            self.replay.shadow = Some(shadow);
-        }
-        self.replay.shadow_source = source;
     }
 
     fn maybe_materialize(&mut self, token_idx: usize) {
-        if self.replay.shadow.is_some() || self.replay.shadow_source.is_some() {
+        if self.replay.shadow.is_some() {
             return;
         }
         let Some(&source) = self.replay.accepting.last() else {
@@ -489,31 +461,35 @@ impl Context<'_> {
         {
             return;
         }
-
-        let mut shadow = self.snapshot();
-        shadow.replay.shadow = None;
-        shadow.replay.shadow_source = None;
-        shadow.replay.spec_undo = None;
-        shadow.replay.promotion_undo = None;
-        let ok = with_snapshot(self.state, &mut shadow, |state| {
+        let mut snapshot = self.snapshot();
+        snapshot.replay.shadow = None;
+        snapshot.replay.spec_undo = None;
+        snapshot.replay.promotion_undo = None;
+        let ok = with_snapshot(self.state, &mut snapshot, |state| {
             with(state, |context| context.recover::<true>(None, false).0)
         });
         if ok {
-            shadow.replay.spec_undo = None;
-            shadow.replay.promotion_undo = None;
-            shadow.state.token_idx = token_idx;
-            self.replay.shadow = Some(Box::new(shadow));
+            snapshot.replay.spec_undo = None;
+            snapshot.replay.promotion_undo = None;
+            snapshot.state.token_idx = token_idx;
+            self.replay.shadow = Some(Shadow {
+                source,
+                snapshot: Box::new(snapshot),
+            });
         }
-        self.replay.shadow_source = Some(source);
     }
 
-    pub(super) fn token_committed(&mut self, tok_bytes: &[u8], tok_id: TokenId) {
-        self.advance_shadow_token(tok_bytes, tok_id);
+    pub(super) fn token_committed(&mut self, bytes: &[u8], token: TokenId) {
+        self.update_shadow(|state| {
+            let ok = matches!(state.apply_token(bytes, token), Ok(0));
+            state.token_idx += usize::from(ok);
+            ok
+        });
         self.maybe_materialize(self.state.token_idx + 1);
     }
 
     pub(super) fn forced_byte_committed(&mut self, byte: u8) {
-        self.advance_shadow_byte(byte);
+        self.update_shadow(|state| state.try_push_byte_definitive(Some(byte)) == (true, 0));
         self.maybe_materialize(self.state.token_idx);
     }
 
