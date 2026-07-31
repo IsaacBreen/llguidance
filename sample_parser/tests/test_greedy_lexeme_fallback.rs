@@ -459,7 +459,7 @@ fn test_low_level_recognizer_hook_covers_greedy_fallback() {
         true,
     )
     .unwrap();
-    parser.parser.with_recognizer(|recognizer| {
+    parser.parser.with_any_recognizer(|recognizer| {
         recognizer.trie_started("greedy_hook");
         assert!(recognizer.try_push_byte(b'a'));
         recognizer.pop_bytes(1);
