@@ -4191,6 +4191,7 @@ impl BiasRecognizer for AnyParserRecognizer<'_> {
 
 pub trait BiasComputer: Send + Sync {
     fn compute_bias(&self, rec: &mut ParserRecognizer<'_>, start: &[u8]) -> SimpleVob;
+    fn trie(&self) -> &TokTrie;
 
     /// Checkpoint-aware mask computation. Existing implementations remain
     /// source-compatible; the default performs an unsliced trie traversal.
@@ -4201,8 +4202,6 @@ pub trait BiasComputer: Send + Sync {
         self.trie().add_bias(rec, &mut set, start);
         set
     }
-
-    fn trie(&self) -> &TokTrie;
 }
 
 // Processing of the parser and the lexer is heavily interlocked.
