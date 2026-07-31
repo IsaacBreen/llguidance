@@ -1259,6 +1259,18 @@ impl ParserState {
     // method in this file.  It is well below llguidance's top-level methods, but in the llguidance
     // LLInterpreter interface, it is called indirectly via the commit_token() method.
     pub fn apply_token(&mut self, tok_bytes: &[u8], tok_id: TokenId) -> Result<usize> {
+        let result = self.apply_token_raw(tok_bytes, tok_id);
+        if self.greedy_replay.is_some() {
+            match result {
+                Ok(0) => greedy_replay::token_committed(self, tok_bytes, tok_id),
+                Ok(_) => greedy_replay::discard_shadow(self),
+                Err(_) => {}
+            }
+        }
+        result
+    }
+
+    fn apply_token_raw(&mut self, tok_bytes: &[u8], tok_id: TokenId) -> Result<usize> {
         self.assert_definitive();
 
         item_trace!("apply_token: {:?}", String::from_utf8_lossy(tok_bytes));
@@ -1518,6 +1530,7 @@ impl ParserState {
                                 all_ok = false;
                                 break;
                             }
+                            greedy_replay::forced_byte_committed(s, b);
                         }
 
                         if !all_ok {
@@ -1543,6 +1556,7 @@ impl ParserState {
                     debug!("  force_bytes reject {}", b as char);
                     break;
                 }
+                greedy_replay::forced_byte_committed(s, b);
             }
         });
         self.assert_definitive();
