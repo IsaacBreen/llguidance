@@ -121,18 +121,14 @@ impl Context<'_> {
     }
 
     fn record_top_if_accepting(&mut self) {
-        if !self.state.scratch.definitive {
-            return;
-        }
         let idx = self.state.lexer_stack.len() - 1;
         let lexer_state = self.state.lexer_stack[idx].lexer_state;
         if matches!(
             self.state.lexer_mut().try_lexeme_end(lexer_state),
             LexerResult::Lexeme(_)
-        ) {
-            if self.replay.accepting.last() != Some(&idx) {
-                self.replay.accepting.push(idx);
-            }
+        ) && self.replay.accepting.last() != Some(&idx)
+        {
+            self.replay.accepting.push(idx);
         }
     }
 
