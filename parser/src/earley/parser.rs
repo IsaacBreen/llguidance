@@ -1035,13 +1035,16 @@ impl ParserState {
 
     #[inline(always)]
     fn pop_lexer_states(&mut self, n: usize) {
+        if self.greedy_replay.is_none() {
+            self.lexer_stack
+                .truncate(self.lexer_stack.len().saturating_sub(n));
+            return;
+        }
         let target = self.lexer_stack.len().saturating_sub(n);
-        if self.greedy_replay.is_some() && !self.scratch.definitive {
-            greedy_replay::restore_spec_to(self, target);
-        } else if self.greedy_replay.is_some() {
+        if self.scratch.definitive {
             greedy_replay::truncate_history(self, target);
         } else {
-            self.lexer_stack.truncate(target);
+            greedy_replay::restore_spec_to(self, target);
         }
     }
 
@@ -1611,24 +1614,11 @@ impl ParserState {
                     lexer_state: next_state,
                     byte: Some(byte),
                 });
-                greedy_replay::record_top_if_accepting(self);
                 true
             }
             LexerResult::Error => false,
-            LexerResult::Lexeme(pre_lexeme) => {
-                let result = self.advance_parser(pre_lexeme);
-                if result {
-                    greedy_replay::record_top_if_accepting(self);
-                }
-                result
-            }
-            LexerResult::SpecialToken(state) => {
-                let result = self.special_pre_lexeme(state);
-                if result {
-                    greedy_replay::record_top_if_accepting(self);
-                }
-                result
-            }
+            LexerResult::Lexeme(pre_lexeme) => self.advance_parser(pre_lexeme),
+            LexerResult::SpecialToken(state) => self.special_pre_lexeme(state),
         }
     }
 
@@ -1733,9 +1723,12 @@ impl ParserState {
             );
         }
 
-        let lexer_error = res.is_error();
         assert_eq!(self.backtrack_byte_count, 0);
+        let lexer_error = res.is_error();
         if self.advance_lexer_or_parser(res, curr) {
+            if self.greedy_replay.is_some() {
+                greedy_replay::record_top_if_accepting(self);
+            }
             if let Some(b) = byte {
                 self.bytes.push(b);
             }
@@ -1854,6 +1847,9 @@ impl ParserState {
         let lex_result = self.lexer_mut().try_lexeme_end(curr.lexer_state);
         let prev_len = self.lexer_stack.len();
         let result = self.advance_lexer_or_parser(lex_result, curr);
+        if result && self.scratch.definitive && self.greedy_replay.is_some() {
+            greedy_replay::record_top_if_accepting(self);
+        }
         if self.lexer_stack.len() != prev_len {
             assert_eq!(self.lexer_stack.len(), prev_len + 1);
             assert!(prev_len > 0);
@@ -2847,11 +2843,16 @@ impl Recognizer for ParserRecognizer<'_> {
             }
         }
 
-        let lexer_error = res.is_error();
-        let mut result = self.state.advance_lexer_or_parser(res, curr);
-        if !result && lexer_error && self.state.greedy_replay.is_some() {
-            result = greedy_replay::recover_speculative(self.state, Some(byte), false);
-        }
+        let result = if self.state.greedy_replay.is_none() {
+            self.state.advance_lexer_or_parser(res, curr)
+        } else {
+            match res {
+                LexerResult::Error => {
+                    greedy_replay::recover_speculative(self.state, Some(byte), false)
+                }
+                other => self.state.advance_lexer_or_parser(other, curr),
+            }
+        };
 
         if ITEM_TRACE && !result {
             self.state.trace_byte_stack.pop();
