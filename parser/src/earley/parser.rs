@@ -714,10 +714,8 @@ impl ParserState {
         } else {
             INVALID_TOKEN
         };
-        let greedy_replay = grammar
-            .lexer_spec()
-            .greedy_lexeme_fallback
-            .then(|| Box::new(GreedyReplay::default()));
+        let greedy = grammar.lexer_spec().greedy_lexeme_fallback;
+        let greedy_replay = greedy.then(|| Box::new(GreedyReplay::default()));
         let mut r = ParserState {
             grammar,
             tok_env,
@@ -827,7 +825,7 @@ impl ParserState {
         lbl: &str,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        self.max_all_items = self.stats.all_items + limit;
+        self.max_all_items = self.stats.all_items.saturating_add(limit);
 
         let r = f(self);
 
@@ -2739,8 +2737,6 @@ pub struct ParserRecognizer<'a, const GREEDY: bool = false> {
     state: &'a mut ParserState,
 }
 
-pub type GreedyParserRecognizer<'a> = ParserRecognizer<'a, true>;
-
 impl<const GREEDY: bool> ParserRecognizer<'_, GREEDY> {
     pub fn lexer_mut(&mut self) -> &mut Lexer {
         self.state.lexer_mut()
@@ -2766,8 +2762,7 @@ pub trait BiasComputer: Send + Sync {
     fn compute_bias(&self, rec: &mut ParserRecognizer<'_>, start: &[u8]) -> SimpleVob;
     fn trie(&self) -> &TokTrie;
 
-    #[doc(hidden)]
-    fn compute_bias_greedy(&self, rec: &mut GreedyParserRecognizer<'_>, start: &[u8]) -> SimpleVob {
+    fn compute_bias_greedy(&self, rec: &mut ParserRecognizer<'_, true>, start: &[u8]) -> SimpleVob {
         let mut set = self.trie().alloc_token_set();
         self.trie().add_bias(rec, &mut set, start);
         set
@@ -2944,7 +2939,7 @@ impl Parser {
     pub fn with_recognizer<T>(&mut self, f: impl FnOnce(&mut ParserRecognizer) -> T) -> T {
         assert!(
             self.state.shared_box.greedy_replay.is_none(),
-            "with_recognizer is unavailable with greedy_lexeme_fallback; use with_any_recognizer"
+            "use with_any_recognizer"
         );
         self.with_shared(|state| f(&mut ParserRecognizer::<false> { state }))
     }

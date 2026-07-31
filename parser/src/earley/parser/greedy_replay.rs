@@ -14,14 +14,8 @@ struct Shadow {
     snapshot: Box<Snapshot>,
 }
 
-#[derive(Clone, Copy)]
-enum Origin {
-    Current,
-    Shadow(usize),
-}
-
 struct Attempt {
-    origin: Origin,
+    source: Option<usize>,
     previous: Box<Snapshot>,
     prefix: usize,
     existing: usize,
@@ -98,18 +92,19 @@ impl Context<'_> {
 
     fn checkpoint(&mut self, idx: usize, row: u32) -> Option<(usize, PreLexeme, Vec<u8>)> {
         let item = *self.state.lexer_stack.get(idx)?;
-        if item.row_idx != row {
-            return None;
-        }
+        (item.row_idx == row).then_some(())?;
         let LexerResult::Lexeme(pre) = self.state.lexer_mut().try_lexeme_end(item.lexer_state)
         else {
             return None;
         };
-        let bytes = self.state.lexer_stack[idx + 1..]
-            .iter()
-            .map(|state| state.byte)
-            .collect::<Option<_>>()?;
-        Some((idx, pre, bytes))
+        Some((
+            idx,
+            pre,
+            self.state.lexer_stack[idx + 1..]
+                .iter()
+                .map(|state| state.byte)
+                .collect::<Option<_>>()?,
+        ))
     }
 
     fn latest_accepting(&mut self) -> Option<(usize, PreLexeme, Vec<u8>)> {
@@ -133,20 +128,14 @@ impl Context<'_> {
 
     pub(super) fn truncate_lexer(&mut self, target: usize) {
         self.state.lexer_stack.truncate(target);
-        while self
-            .replay
-            .accepting
-            .last()
-            .is_some_and(|idx| *idx >= target)
-        {
-            self.replay.accepting.pop();
-        }
-        if self
+        let keep = self.replay.accepting.partition_point(|&idx| idx < target);
+        self.replay.accepting.truncate(keep);
+        let stale_shadow = self
             .replay
             .shadow
             .as_ref()
-            .is_some_and(|shadow| shadow.source >= target)
-        {
+            .is_some_and(|s| s.source >= target);
+        if stale_shadow {
             self.replay.shadow = None;
         }
     }
@@ -154,11 +143,11 @@ impl Context<'_> {
     pub(super) fn record_top_if_accepting(&mut self) {
         let idx = self.state.lexer_stack.len() - 1;
         let state = self.state.lexer_stack[idx].lexer_state;
-        if matches!(
+        let accepting = matches!(
             self.state.lexer_mut().try_lexeme_end(state),
             LexerResult::Lexeme(_)
-        ) && self.replay.accepting.last() != Some(&idx)
-        {
+        );
+        if accepting && self.replay.accepting.last() != Some(&idx) {
             self.replay.accepting.push(idx);
             self.replay.shadow = None;
         }
@@ -166,28 +155,25 @@ impl Context<'_> {
 
     fn finish_shadow_speculation(&mut self) {
         self.restore_all_spec();
-        self.state
-            .scratch
-            .grammar_stack
-            .truncate(self.state.trie_grammar_stack);
         self.truncate_lexer(self.state.trie_lexer_stack);
-        self.state.scratch.definitive = true;
-        self.state.rows_valid_end = self.state.num_rows();
-        self.state.scratch.log_override = false;
-        self.state.lexer_stack_flush_position = 0;
+        self.state.trie_finished_inner();
     }
 
-    fn restore_shadow(&mut self, previous: Box<Snapshot>, source: usize) {
-        self.finish_shadow_speculation();
-        let snapshot = self.swap(previous);
-        self.replay.shadow = Some(Shadow { source, snapshot });
+    fn restore_saved(&mut self, previous: Box<Snapshot>, source: Option<usize>, finish: bool) {
+        if finish {
+            self.finish_shadow_speculation();
+        }
+        if let Some(source) = source {
+            let snapshot = self.swap(previous);
+            self.replay.shadow = Some(Shadow { source, snapshot });
+        } else {
+            self.restore(*previous);
+        }
     }
 
     fn restore_undo(&mut self, undo: Undo) {
-        match undo.shadow_source {
-            Some(source) => self.restore_shadow(undo.previous, source),
-            None => self.restore(*undo.previous),
-        }
+        let source = undo.shadow_source;
+        self.restore_saved(undo.previous, source, source.is_some());
     }
 
     pub(super) fn restore_spec_to(&mut self, target: usize) {
@@ -195,7 +181,7 @@ impl Context<'_> {
             .replay
             .spec_undo
             .as_ref()
-            .is_some_and(|undo| undo.trigger > target)
+            .is_some_and(|u| u.trigger > target)
         {
             let undo = self.replay.spec_undo.take().unwrap();
             self.restore_undo(undo);
@@ -292,23 +278,8 @@ impl Context<'_> {
         self.state.bias_cache = None;
     }
 
-    fn restore_failed(&mut self, attempt: Attempt) {
-        match attempt.origin {
-            Origin::Current => self.restore(*attempt.previous),
-            Origin::Shadow(source) => {
-                let snapshot = self.swap(attempt.previous);
-                self.replay.shadow = Some(Shadow { source, snapshot });
-            }
-        }
-    }
-
     fn prepare_shadow<const DEFINITIVE: bool>(&mut self) -> Option<Attempt> {
         let Shadow { source, snapshot } = self.replay.shadow.take()?;
-        let floor = self
-            .state
-            .trie_lexer_stack
-            .min(self.state.lexer_stack.len());
-        let end = self.state.lexer_stack.len();
         let previous = self.swap(snapshot);
         if !DEFINITIVE {
             self.state.trie_started_inner("greedy_shadow");
@@ -316,38 +287,34 @@ impl Context<'_> {
         let (prefix, existing, bytes) = if DEFINITIVE {
             let prefix = self.state.bytes.len();
             if prefix > previous.state.bytes.len() {
-                self.restore_failed(Attempt {
-                    origin: Origin::Shadow(source),
-                    previous,
-                    prefix: 0,
-                    existing: 0,
-                    bytes: Vec::new(),
-                });
+                self.restore_saved(previous, Some(source), false);
                 return None;
             }
             let bytes = previous.state.bytes[prefix..].to_vec();
             let existing = bytes.len();
             let mapping = &previous.state.byte_to_token_idx;
             let mapped = prefix.min(mapping.len());
-            if self.state.byte_to_token_idx.len() < mapped {
-                self.state
-                    .byte_to_token_idx
-                    .extend_from_slice(&mapping[self.state.byte_to_token_idx.len()..mapped]);
+            if let Some(missing) = mapping.get(self.state.byte_to_token_idx.len()..mapped) {
+                self.state.byte_to_token_idx.extend_from_slice(missing);
             }
             (prefix, existing, bytes)
         } else {
-            let Some(bytes) = previous.state.lexer_stack[floor..end]
+            let floor = previous
+                .state
+                .trie_lexer_stack
+                .min(previous.state.lexer_stack.len());
+            let Some(bytes) = previous.state.lexer_stack[floor..]
                 .iter()
                 .map(|state| state.byte)
                 .collect::<Option<_>>()
             else {
-                self.restore_shadow(previous, source);
+                self.restore_saved(previous, Some(source), true);
                 return None;
             };
             (0, 0, bytes)
         };
         Some(Attempt {
-            origin: Origin::Shadow(source),
+            source: Some(source),
             previous,
             prefix,
             existing,
@@ -395,7 +362,7 @@ impl Context<'_> {
             }
         }
         Some(Attempt {
-            origin: Origin::Current,
+            source: None,
             previous,
             prefix: prefix + 1,
             existing: existing.saturating_sub(1),
@@ -408,14 +375,14 @@ impl Context<'_> {
         byte: Option<u8>,
         flush_end: bool,
     ) -> (bool, usize) {
-        let from_shadow = self.replay.shadow.is_some();
-        let Some(attempt) = (if from_shadow {
+        let Some(attempt) = (if self.replay.shadow.is_some() {
             self.prepare_shadow::<DEFINITIVE>()
         } else {
             self.prepare_current::<DEFINITIVE>(byte)
         }) else {
             return (false, 0);
         };
+        let from_shadow = attempt.source.is_some();
         let (mut ok, mut backtrack) = self.replay_bytes::<DEFINITIVE>(&attempt);
         if ok && from_shadow {
             if let Some(byte) = byte {
@@ -426,16 +393,10 @@ impl Context<'_> {
             ok = self.flush::<DEFINITIVE>();
         }
         if !ok || backtrack > 0 {
-            if !DEFINITIVE && from_shadow {
-                self.finish_shadow_speculation();
-            }
-            self.restore_failed(attempt);
+            self.restore_saved(attempt.previous, attempt.source, !DEFINITIVE && from_shadow);
             return (false, backtrack);
         }
-        let shadow_source = match attempt.origin {
-            Origin::Shadow(source) if !DEFINITIVE => Some(source),
-            _ => None,
-        };
+        let shadow_source = if DEFINITIVE { None } else { attempt.source };
         self.install_undo::<DEFINITIVE>(attempt.previous, shadow_source, byte.is_some());
         (true, backtrack)
     }
@@ -511,7 +472,7 @@ impl Context<'_> {
             .replay
             .promotion_undo
             .as_ref()
-            .is_some_and(|undo| target < undo.trigger)
+            .is_some_and(|u| target < u.trigger)
         {
             let undo = self.replay.promotion_undo.take().unwrap();
             self.restore(*undo.previous);

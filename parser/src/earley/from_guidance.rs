@@ -43,9 +43,7 @@ impl CompileCtx {
             bail!("grammar must have either lark_grammar or json_schema");
         };
 
-        if input.greedy_lexeme_fallback {
-            res.builder.regex.spec.greedy_lexeme_fallback = true;
-        }
+        res.builder.regex.spec.greedy_lexeme_fallback |= input.greedy_lexeme_fallback;
 
         res.builder.check_limits()?;
 

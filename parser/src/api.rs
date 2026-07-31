@@ -59,10 +59,6 @@ pub struct LLGuidanceOptions {
     #[serde(default)]
     pub allow_initial_skip: bool,
 
-    /// Preserve earlier accepting greedy-lexeme boundaries and recover one
-    /// when the longer candidate can no longer extend the parse. This is
-    /// opt-in so existing grammars retain the original lexer hot path and
-    /// performance characteristics.
     #[serde(default, skip_serializing_if = "is_false")]
     pub greedy_lexeme_fallback: bool,
 }
@@ -78,9 +74,7 @@ impl LLGuidanceOptions {
         if other.allow_initial_skip {
             self.allow_initial_skip = true;
         }
-        if other.greedy_lexeme_fallback {
-            self.greedy_lexeme_fallback = true;
-        }
+        self.greedy_lexeme_fallback |= other.greedy_lexeme_fallback;
     }
 }
 
@@ -292,12 +286,12 @@ pub struct ParserLimits {
 impl Default for ParserLimits {
     fn default() -> Self {
         Self {
-            max_items_in_row: 2000,
-            initial_lexer_fuel: 1_000_000, // fhir schema => 500k
-            step_lexer_fuel: 200_000,      //
-            max_lexer_states: 250_000,     //
-            max_grammar_size: 500_000,     // fhir schema => 200k
-            step_max_items: 50_000,        //
+            max_items_in_row: usize::MAX,
+            initial_lexer_fuel: u64::MAX,
+            step_lexer_fuel: u64::MAX,
+            max_lexer_states: usize::MAX,
+            max_grammar_size: usize::MAX,
+            step_max_items: usize::MAX,
             precompute_large_lexemes: true,
             verbose_errors: true,
         }
