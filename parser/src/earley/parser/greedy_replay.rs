@@ -12,6 +12,7 @@ struct Snapshot {
 struct SpecUndo {
     trigger_lexer_len: usize,
     previous: Snapshot,
+    shadow_promotion: bool,
 }
 
 #[derive(Clone)]
@@ -155,6 +156,38 @@ impl Context<'_> {
         }
     }
 
+    fn finish_active_shadow_speculation(&mut self) {
+        self.restore_all_spec();
+        self.state
+            .scratch
+            .grammar_stack
+            .truncate(self.state.trie_grammar_stack);
+        self.truncate_lexer(self.state.trie_lexer_stack);
+        self.state.scratch.definitive = true;
+        self.state.rows_valid_end = self.state.num_rows();
+        self.state.scratch.log_override = false;
+        self.state.lexer_stack_flush_position = 0;
+    }
+
+    fn restore_shadow_promotion(&mut self, previous: Snapshot) {
+        self.finish_active_shadow_speculation();
+        let mut shadow_state = std::mem::replace(self.state, previous.state);
+        let shadow_replay = std::mem::replace(self.replay, previous.replay);
+        self.state.shared_box = std::mem::take(&mut shadow_state.shared_box);
+        self.replay.shadow = Some(Box::new(Snapshot {
+            state: shadow_state,
+            replay: shadow_replay,
+        }));
+    }
+
+    fn restore_spec_undo(&mut self, undo: SpecUndo) {
+        if undo.shadow_promotion {
+            self.restore_shadow_promotion(undo.previous);
+        } else {
+            self.restore(undo.previous);
+        }
+    }
+
     fn restore_spec_to(&mut self, target: usize) {
         while self
             .replay
@@ -162,15 +195,15 @@ impl Context<'_> {
             .as_ref()
             .is_some_and(|undo| undo.trigger_lexer_len > target)
         {
-            let undo = self.replay.spec_undo.take().unwrap();
-            self.restore(undo.previous);
+            let undo = *self.replay.spec_undo.take().unwrap();
+            self.restore_spec_undo(undo);
         }
         self.truncate_lexer(target);
     }
 
     fn restore_all_spec(&mut self) {
         while let Some(undo) = self.replay.spec_undo.take() {
-            self.restore(undo.previous);
+            self.restore_spec_undo(*undo);
         }
     }
 
@@ -192,33 +225,40 @@ impl Context<'_> {
         byte: Option<u8>,
         flush_end: bool,
     ) -> Option<bool> {
-        let shadow = self.replay.shadow.as_ref()?.as_ref().clone();
         let bytes = self.speculative_bytes(byte)?;
-        let previous = self.snapshot();
-        let mut promoted = shadow;
-        let ok = with_snapshot(self.state, &mut promoted, |state| {
-            state.trie_started_inner("greedy_shadow");
-            let mut recognizer = ParserRecognizer { state };
-            let mut ok = true;
-            for &byte in &bytes {
-                if !recognizer.try_push_byte(byte) {
-                    ok = false;
-                    break;
-                }
+        let shadow = self.replay.shadow.take()?;
+        let mut previous = Snapshot {
+            state: std::mem::replace(self.state, shadow.state),
+            replay: std::mem::replace(self.replay, shadow.replay),
+        };
+        self.state.shared_box = std::mem::take(&mut previous.state.shared_box);
+        self.state.trie_started_inner("greedy_shadow");
+
+        let mut ok = true;
+        for &byte in &bytes {
+            if !self.try_push_speculative(byte) {
+                ok = false;
+                break;
             }
-            if ok && flush_end {
-                ok = recognizer.state.flush_lexer();
-            }
-            ok
-        });
+        }
+        if ok && flush_end {
+            ok = self.flush_speculative();
+        }
         if !ok {
+            self.restore_shadow_promotion(previous);
             return Some(false);
         }
-        self.restore(promoted);
-        self.replay.spec_undo = Some(Box::new(SpecUndo {
+
+        let undo = Box::new(SpecUndo {
             trigger_lexer_len: self.state.lexer_stack.len(),
             previous,
-        }));
+            shadow_promotion: true,
+        });
+        let mut slot = &mut self.replay.spec_undo;
+        while let Some(existing) = slot {
+            slot = &mut existing.previous.replay.spec_undo;
+        }
+        *slot = Some(undo);
         self.state.bias_cache = None;
         Some(true)
     }
@@ -323,6 +363,7 @@ impl Context<'_> {
             self.replay.spec_undo = Some(Box::new(SpecUndo {
                 trigger_lexer_len: self.state.lexer_stack.len(),
                 previous,
+                shadow_promotion: false,
             }));
             self.state.bias_cache = None;
             true
