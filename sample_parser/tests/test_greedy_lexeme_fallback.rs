@@ -106,8 +106,18 @@ fn test_greedy_shadow_nested_checkpoint_chain() {
         V: /d{{{n}}}f/
     "#
     );
-    let input = format!("ab{}f", "d".repeat(n));
-    lark_str_test(&grammar, true, &input, true);
+    let prefix = format!("ab{}", "d".repeat(n));
+    let mut parser = make_parser(&grammar, true).unwrap();
+    feed_greedy_text(&mut parser, &prefix);
+
+    let token = get_tok_env().tokenize("f")[0];
+    for _ in 0..2 {
+        let mask = parser.compute_mask().unwrap();
+        assert!(mask.is_allowed(token));
+        assert_eq!(parser.final_bytes(), prefix.as_bytes());
+    }
+    consume(&mut parser, token);
+    assert!(parser.is_accepting());
 }
 
 #[test]
