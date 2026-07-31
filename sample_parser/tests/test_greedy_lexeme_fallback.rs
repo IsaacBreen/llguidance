@@ -1,5 +1,4 @@
 use llguidance::api::{LLGuidanceOptions, TopLevelGrammar};
-use llguidance::toktrie::Recognizer;
 use sample_parser::{get_parser_factory, get_tok_env};
 
 mod common_lark_utils;
