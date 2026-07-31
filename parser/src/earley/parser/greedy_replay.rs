@@ -9,7 +9,6 @@ struct Undo {
 
 #[derive(Clone, Default)]
 pub(super) struct GreedyReplay {
-    speculative: Option<Box<Undo>>,
     promotion: Option<Box<Undo>>,
 }
 
@@ -64,34 +63,16 @@ impl Context<'_> {
         None
     }
 
-    pub(super) fn restore_spec(&mut self, target: Option<usize>) {
-        while let Some(undo) = self
-            .replay
-            .speculative
-            .take_if(|undo| target.is_none_or(|target| undo.trigger > target))
-        {
-            self.restore(undo);
-        }
-        if let Some(target) = target {
-            self.state.lexer_stack.truncate(target);
-        }
-    }
-
-    fn push<const DEFINITIVE: bool>(&mut self, byte: u8) -> (bool, usize) {
-        let result = if DEFINITIVE {
-            self.state.try_push_byte_definitive(Some(byte))
-        } else {
-            let ok = ParserRecognizer::<false> { state: self.state }.try_push_byte(byte);
-            (ok, 0)
-        };
+    fn push(&mut self, byte: u8) -> (bool, usize) {
+        let result = self.state.try_push_byte_definitive(Some(byte));
         if result.0 {
             result
         } else {
-            self.recover::<DEFINITIVE>(Some(byte))
+            self.recover(Some(byte), false)
         }
     }
 
-    pub(super) fn recover<const DEFINITIVE: bool>(&mut self, byte: Option<u8>) -> (bool, usize) {
+    pub(super) fn recover(&mut self, byte: Option<u8>, flush_end: bool) -> (bool, usize) {
         let Some((checkpoint, mut pre)) = self.latest_accepting() else {
             return (false, 0);
         };
@@ -108,21 +89,16 @@ impl Context<'_> {
             return (false, 0);
         };
         let previous = self.snapshot();
-        let prefix = if DEFINITIVE {
-            let Some(prefix) = self.state.bytes.len().checked_sub(existing) else {
-                return (false, 0);
-            };
-            self.state.bytes.truncate(prefix);
-            self.state
-                .byte_to_token_idx
-                .truncate(prefix.min(self.state.byte_to_token_idx.len()));
-            self.state.row_infos.truncate(self.state.num_rows());
-            self.state.last_force_bytes_len = usize::MAX;
-            self.state.rows_valid_end = self.state.num_rows();
-            prefix
-        } else {
-            0
+        let Some(prefix) = self.state.bytes.len().checked_sub(existing) else {
+            return (false, 0);
         };
+        self.state.bytes.truncate(prefix);
+        self.state
+            .byte_to_token_idx
+            .truncate(prefix.min(self.state.byte_to_token_idx.len()));
+        self.state.row_infos.truncate(self.state.num_rows());
+        self.state.last_force_bytes_len = usize::MAX;
+        self.state.rows_valid_end = self.state.num_rows();
         self.state.lexer_stack.truncate(checkpoint + 1);
         self.state.lexer_stack_top_eos = false;
         self.state.lexer_stack_flush_position = 0;
@@ -130,16 +106,16 @@ impl Context<'_> {
         pre.byte_next_row = true;
         let mut ok = self.state.advance_parser(pre);
         let mut backtrack = 0;
-        if ok && DEFINITIVE {
+        if ok {
             self.state.bytes.push(first);
         }
         for &byte in rest {
             if !ok {
                 break;
             }
-            (ok, backtrack) = self.push::<DEFINITIVE>(byte);
+            (ok, backtrack) = self.push(byte);
         }
-        if DEFINITIVE && ok && backtrack == 0 {
+        if ok && backtrack == 0 {
             let end = (prefix + existing).min(previous.state.byte_to_token_idx.len());
             if prefix < end {
                 self.state
@@ -147,29 +123,29 @@ impl Context<'_> {
                     .extend_from_slice(&previous.state.byte_to_token_idx[prefix..end]);
             }
         }
-        if ok && backtrack == 0 && byte.is_none() {
-            ok = self.state.flush_lexer() || self.recover::<DEFINITIVE>(None).0;
+        if ok && backtrack == 0 && flush_end {
+            ok = self.state.flush_lexer() || self.recover(None, true).0;
         }
         if !ok || backtrack > 0 {
             self.restore(previous);
             return (false, backtrack);
         }
         let mut previous = previous;
-        previous.trigger = if DEFINITIVE {
-            previous.state.bytes.len() + usize::from(byte.is_some())
-        } else {
-            self.state.lexer_stack.len()
-        };
-        if DEFINITIVE {
-            self.replay.speculative = None;
-        }
-        let slot = if DEFINITIVE {
-            &mut self.replay.promotion
-        } else {
-            &mut self.replay.speculative
-        };
-        *slot = Some(previous);
+        previous.trigger = previous.state.bytes.len() + usize::from(byte.is_some());
+        self.replay.promotion = Some(previous);
         (true, backtrack)
+    }
+
+    fn fork_prefix(&mut self) -> bool {
+        let Some((checkpoint, pre)) = self.latest_accepting() else {
+            return false;
+        };
+        if checkpoint + 1 == self.state.lexer_stack.len() {
+            self.state.lexer_stack.truncate(checkpoint);
+            self.state.advance_parser(pre)
+        } else {
+            self.recover(None, false).0
+        }
     }
 
     pub(super) fn accepting_allows_eos(&mut self) -> bool {
@@ -183,6 +159,17 @@ impl Context<'_> {
         while let Some(undo) = self.replay.promotion.take_if(|undo| target < undo.trigger) {
             self.restore(undo);
         }
-        self.replay.speculative = None;
+    }
+}
+
+pub(super) fn fork(state: &ParserState) -> Option<ParserState> {
+    let mut fork = state.clone();
+    fork.shared_box.greedy_replay = Some(Box::default());
+    let ok = with(&mut fork, |replay| replay.fork_prefix());
+    if ok {
+        fork.shared_box.greedy_replay.as_mut()?.promotion = None;
+        Some(fork)
+    } else {
+        None
     }
 }
