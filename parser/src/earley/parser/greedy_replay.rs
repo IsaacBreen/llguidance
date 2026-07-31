@@ -36,7 +36,7 @@ struct Context<'a> {
 }
 
 fn with_replay<T>(state: &mut ParserState, f: impl FnOnce(&mut Context<'_>) -> T) -> T {
-    let Some(mut replay) = state.greedy_replay.take() else {
+    let Some(mut replay) = state.shared_box.greedy_replay.take() else {
         panic!("greedy replay requested for an ordinary parser");
     };
     let result = {
@@ -46,7 +46,7 @@ fn with_replay<T>(state: &mut ParserState, f: impl FnOnce(&mut Context<'_>) -> T
         };
         f(&mut context)
     };
-    state.greedy_replay = Some(replay);
+    state.shared_box.greedy_replay = Some(replay);
     result
 }
 
@@ -56,16 +56,16 @@ fn with_snapshot<T>(
     f: impl FnOnce(&mut ParserState) -> T,
 ) -> T {
     snapshot.state.shared_box = std::mem::take(&mut owner.shared_box);
-    snapshot.state.greedy_replay = Some(Box::new(std::mem::take(&mut snapshot.replay)));
+    snapshot.state.shared_box.greedy_replay = Some(Box::new(std::mem::take(&mut snapshot.replay)));
     let result = f(&mut snapshot.state);
-    snapshot.replay = *snapshot.state.greedy_replay.take().unwrap();
+    snapshot.replay = *snapshot.state.shared_box.greedy_replay.take().unwrap();
     owner.shared_box = std::mem::take(&mut snapshot.state.shared_box);
     result
 }
 
 impl Context<'_> {
     fn snapshot(&mut self) -> Snapshot {
-        debug_assert!(self.state.greedy_replay.is_none());
+        debug_assert!(self.state.shared_box.greedy_replay.is_none());
         let shared = std::mem::take(&mut self.state.shared_box);
         let state = self.state.clone();
         self.state.shared_box = shared;
@@ -614,7 +614,7 @@ impl Context<'_> {
 }
 
 pub(super) fn has_checkpoint(state: &ParserState) -> bool {
-    let Some(replay) = state.greedy_replay.as_deref() else {
+    let Some(replay) = state.shared_box.greedy_replay.as_deref() else {
         return false;
     };
     let Some(&idx) = replay.accepting.last() else {
@@ -625,7 +625,7 @@ pub(super) fn has_checkpoint(state: &ParserState) -> bool {
 }
 
 pub(super) fn record_top_if_accepting(state: &mut ParserState) {
-    if state.greedy_replay.is_none() || !state.scratch.definitive {
+    if state.shared_box.greedy_replay.is_none() || !state.scratch.definitive {
         return;
     }
     let idx = state.lexer_stack.len() - 1;
@@ -635,7 +635,7 @@ pub(super) fn record_top_if_accepting(state: &mut ParserState) {
         LexerResult::Lexeme(_)
     );
     if accepting {
-        let replay = state.greedy_replay.as_deref_mut().unwrap();
+        let replay = state.shared_box.greedy_replay.as_deref_mut().unwrap();
         if replay.accepting.last() != Some(&idx) {
             replay.accepting.push(idx);
             replay.shadow = None;
@@ -646,7 +646,7 @@ pub(super) fn record_top_if_accepting(state: &mut ParserState) {
 
 pub(super) fn truncate_history(state: &mut ParserState, target: usize) {
     state.lexer_stack.truncate(target);
-    if let Some(replay) = state.greedy_replay.as_deref_mut() {
+    if let Some(replay) = state.shared_box.greedy_replay.as_deref_mut() {
         while replay.accepting.last().is_some_and(|idx| *idx >= target) {
             replay.accepting.pop();
         }
@@ -680,7 +680,7 @@ pub(super) fn restore_spec_to(state: &mut ParserState, target: usize) {
 }
 
 pub(super) fn restore_all_spec(state: &mut ParserState) {
-    if state.greedy_replay.is_some() {
+    if state.shared_box.greedy_replay.is_some() {
         with_replay(state, |context| context.restore_all_spec());
     }
 }
@@ -690,25 +690,25 @@ pub(super) fn prepare_rollback(state: &mut ParserState, target: usize) {
 }
 
 pub(super) fn token_committed(state: &mut ParserState, tok_bytes: &[u8], tok_id: TokenId) {
-    if state.greedy_replay.is_some() {
+    if state.shared_box.greedy_replay.is_some() {
         with_replay(state, |context| context.token_committed(tok_bytes, tok_id));
     }
 }
 
 pub(super) fn forced_byte_committed(state: &mut ParserState, byte: u8) {
-    if state.greedy_replay.is_some() {
+    if state.shared_box.greedy_replay.is_some() {
         with_replay(state, |context| context.forced_byte_committed(byte));
     }
 }
 
 pub(super) fn discard_shadow(state: &mut ParserState) {
-    if let Some(replay) = state.greedy_replay.as_deref_mut() {
+    if let Some(replay) = state.shared_box.greedy_replay.as_deref_mut() {
         replay.shadow = None;
     }
 }
 
 pub(super) fn accepting_allows_eos(state: &mut ParserState) -> bool {
-    let Some(replay) = state.greedy_replay.as_deref() else {
+    let Some(replay) = state.shared_box.greedy_replay.as_deref() else {
         return false;
     };
     let Some(&idx) = replay.accepting.last() else {

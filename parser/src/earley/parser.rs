@@ -479,7 +479,6 @@ struct ParserState {
     // Cache for compute_bias - avoids recomputing identical masks when lexer state hasn't changed
     // (common in long lexemes, e.g. the interior of JSON strings)
     bias_cache: Option<BiasCache>,
-    greedy_replay: Option<Box<GreedyReplay>>,
 
     shared_box: Box<SharedState>,
 }
@@ -495,6 +494,7 @@ struct BiasCache {
 #[derive(Clone, Default)]
 struct SharedState {
     lexer_opt: Option<Lexer>,
+    greedy_replay: Option<Box<GreedyReplay>>,
 }
 
 impl SharedState {
@@ -751,9 +751,9 @@ impl ParserState {
             trie_grammar_stack: 0,
             parser_error: None,
             bias_cache: None,
-            greedy_replay,
             shared_box: Box::new(SharedState {
                 lexer_opt: Some(lexer),
+                greedy_replay,
             }),
             perf_counters,
         };
@@ -804,7 +804,7 @@ impl ParserState {
         r.lexer_stack[0].lexer_state = state;
         r.assert_definitive();
 
-        let lexer = std::mem::take(&mut r.shared_box).lexer_opt.unwrap();
+        let lexer = r.shared_box.lexer_opt.take().unwrap();
 
         r.stats.lexer_cost = lexer.dfa.total_fuel_spent();
 
@@ -3063,6 +3063,7 @@ impl Parser {
         let (state, lexer) = ParserState::new(tok_env, grammar, limits, perf_counters)?;
         let shared = Arc::new(Mutex::new(Box::new(SharedState {
             lexer_opt: Some(lexer),
+            greedy_replay: None,
         })));
         Ok(Parser { shared, state })
     }
@@ -3072,7 +3073,7 @@ impl Parser {
     /// the LLInterpreter interface.
     pub fn compute_bias(&mut self, computer: &dyn BiasComputer, start: &[u8]) -> SimpleVob {
         self.with_shared(|state| {
-            if state.greedy_replay.is_none() {
+            if state.shared_box.greedy_replay.is_none() {
                 state.compute_bias::<false>(computer, start)
             } else {
                 state.compute_bias::<true>(computer, start)
@@ -3127,7 +3128,7 @@ impl Parser {
 
     pub fn chop_tokens(&mut self, trie: &TokTrie, tokens: &[TokenId]) -> (usize, usize) {
         self.with_shared(|state| {
-            if state.greedy_replay.is_none() {
+            if state.shared_box.greedy_replay.is_none() {
                 trie.chop_tokens(&mut ParserRecognizer { state }, tokens)
             } else {
                 trie.chop_tokens(&mut GreedyParserRecognizer { state }, tokens)
@@ -3137,7 +3138,7 @@ impl Parser {
 
     pub fn with_recognizer<T>(&mut self, f: impl FnOnce(&mut ParserRecognizer) -> T) -> T {
         assert!(
-            self.state.greedy_replay.is_none(),
+            self.state.shared_box.greedy_replay.is_none(),
             "with_recognizer is unavailable with greedy_lexeme_fallback; use with_any_recognizer"
         );
         self.with_shared(|state| f(&mut ParserRecognizer { state }))
@@ -3148,7 +3149,7 @@ impl Parser {
         f: impl FnOnce(&mut AnyParserRecognizer<'_>) -> T,
     ) -> T {
         self.with_shared(|state| {
-            if state.greedy_replay.is_none() {
+            if state.shared_box.greedy_replay.is_none() {
                 f(&mut AnyParserRecognizer::Normal(ParserRecognizer { state }))
             } else {
                 f(&mut AnyParserRecognizer::Greedy(GreedyParserRecognizer {
@@ -3169,7 +3170,7 @@ impl Parser {
             let t0 = Instant::now();
             let prev_len = self.currently_forced_bytes().len();
             self.with_shared(|state| {
-                if state.greedy_replay.is_none() {
+                if state.shared_box.greedy_replay.is_none() {
                     state.force_bytes::<false>();
                 } else {
                     state.force_bytes::<true>();
@@ -3190,7 +3191,7 @@ impl Parser {
 
     pub fn scan_eos(&mut self) -> bool {
         self.with_shared(|state| {
-            if state.greedy_replay.is_none() {
+            if state.shared_box.greedy_replay.is_none() {
                 state.scan_eos::<false>()
             } else {
                 state.scan_eos::<true>()
@@ -3215,7 +3216,7 @@ impl Parser {
 
     pub fn apply_token(&mut self, tok_bytes: &[u8], tok_id: TokenId) -> Result<usize> {
         let r = self.with_shared(|state| {
-            if state.greedy_replay.is_none() {
+            if state.shared_box.greedy_replay.is_none() {
                 state.apply_token::<false>(tok_bytes, tok_id)
             } else {
                 state.apply_token::<true>(tok_bytes, tok_id)
@@ -3227,17 +3228,17 @@ impl Parser {
 
     fn with_shared<T>(&mut self, f: impl FnOnce(&mut ParserState) -> T) -> T {
         let mut shared = self.shared.lock().unwrap();
-        self.state.shared_box = std::mem::take(&mut *shared);
-        let r = f(&mut self.state);
-        *shared = std::mem::take(&mut self.state.shared_box);
+        std::mem::swap(&mut self.state.shared_box.lexer_opt, &mut shared.lexer_opt);
+        let result = f(&mut self.state);
+        std::mem::swap(&mut self.state.shared_box.lexer_opt, &mut shared.lexer_opt);
         assert!(shared.lexer_opt.is_some());
-        r
+        result
     }
 
     pub fn rollback(&mut self, n_bytes: usize) -> Result<()> {
         self.state.lexer_spec().check_rollback()?;
         self.with_shared(|state| {
-            if state.greedy_replay.is_none() {
+            if state.shared_box.greedy_replay.is_none() {
                 state.rollback::<false>(n_bytes)
             } else {
                 state.rollback::<true>(n_bytes)
@@ -3248,7 +3249,7 @@ impl Parser {
     /// Returns how many tokens can be applied.
     pub fn validate_tokens(&mut self, tokens: &[TokenId]) -> usize {
         self.with_shared(|state| {
-            let r = if state.greedy_replay.is_none() {
+            let r = if state.shared_box.greedy_replay.is_none() {
                 state.validate_tokens::<false>(tokens)
             } else {
                 state.validate_tokens::<true>(tokens)
@@ -3282,7 +3283,7 @@ impl Parser {
 
     pub fn is_accepting(&mut self) -> bool {
         self.with_shared(|state| {
-            if state.greedy_replay.is_none() {
+            if state.shared_box.greedy_replay.is_none() {
                 state.is_accepting::<false>()
             } else {
                 state.is_accepting::<true>()
