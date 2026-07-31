@@ -289,7 +289,7 @@ impl Context<'_> {
 
             let mut backtrack = 0;
             for (idx, replay_byte) in replay_bytes.iter().copied().enumerate() {
-                let (ok, bt) = state.try_push_byte_definitive(Some(replay_byte));
+                let (ok, bt) = state.try_push_byte_definitive::<true>(Some(replay_byte));
                 if !ok || bt > 0 {
                     return (false, bt);
                 }
@@ -299,13 +299,13 @@ impl Context<'_> {
                 }
             }
             if let Some(byte) = byte {
-                let (ok, bt) = state.try_push_byte_definitive(Some(byte));
+                let (ok, bt) = state.try_push_byte_definitive::<true>(Some(byte));
                 if !ok || bt > 0 {
                     return (false, bt);
                 }
                 backtrack = bt;
             }
-            if flush_end && !state.flush_lexer() {
+            if flush_end && !state.flush_lexer::<true>() {
                 return (false, 0);
             }
             (true, backtrack)
@@ -391,7 +391,7 @@ impl Context<'_> {
     }
 
     fn flush_speculative(&mut self) -> bool {
-        if self.state.flush_lexer_raw() {
+        if self.state.flush_lexer_raw::<true>() {
             true
         } else {
             self.recover_speculative(None, true)
@@ -519,7 +519,7 @@ impl Context<'_> {
     }
 
     fn flush_definitive(&mut self) -> bool {
-        if self.state.flush_lexer_raw() {
+        if self.state.flush_lexer_raw::<true>() {
             true
         } else {
             self.recover_definitive(None, true).0
@@ -532,7 +532,7 @@ impl Context<'_> {
             return;
         };
         let result = with_snapshot(self.state, &mut shadow, |state| {
-            state.apply_token(tok_bytes, tok_id)
+            state.apply_token::<true>(tok_bytes, tok_id)
         });
         if matches!(result, Ok(0)) {
             shadow.state.token_idx += 1;
@@ -549,7 +549,7 @@ impl Context<'_> {
             return;
         };
         let result = with_snapshot(self.state, &mut shadow, |state| {
-            state.try_push_byte_definitive(Some(byte))
+            state.try_push_byte_definitive::<true>(Some(byte))
         });
         if result == (true, 0) {
             self.replay.shadow = Some(shadow);
