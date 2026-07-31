@@ -11,7 +11,7 @@ struct Snapshot {
 #[derive(Clone)]
 struct SpecUndo {
     trigger_lexer_len: usize,
-    previous: Snapshot,
+    previous: Box<Snapshot>,
     shadow_promotion: bool,
 }
 
@@ -26,7 +26,7 @@ pub(super) struct GreedyReplay {
     accepting: Vec<usize>,
     shadow: Option<Box<Snapshot>>,
     shadow_source: Option<usize>,
-    spec_undo: Option<Box<SpecUndo>>,
+    spec_undo: Option<SpecUndo>,
     promotion_undo: Option<Box<PromotionUndo>>,
 }
 
@@ -169,22 +169,25 @@ impl Context<'_> {
         self.state.lexer_stack_flush_position = 0;
     }
 
-    fn restore_shadow_promotion(&mut self, previous: Snapshot) {
+    fn swap_snapshot(&mut self, mut snapshot: Box<Snapshot>) -> Box<Snapshot> {
+        let shared = std::mem::take(&mut self.state.shared_box);
+        std::mem::swap(self.state, &mut snapshot.state);
+        self.state.shared_box = shared;
+        std::mem::swap(self.replay, &mut snapshot.replay);
+        snapshot
+    }
+
+    fn restore_shadow_promotion(&mut self, previous: Box<Snapshot>) {
         self.finish_active_shadow_speculation();
-        let mut shadow_state = std::mem::replace(self.state, previous.state);
-        let shadow_replay = std::mem::replace(self.replay, previous.replay);
-        self.state.shared_box = std::mem::take(&mut shadow_state.shared_box);
-        self.replay.shadow = Some(Box::new(Snapshot {
-            state: shadow_state,
-            replay: shadow_replay,
-        }));
+        let shadow = self.swap_snapshot(previous);
+        self.replay.shadow = Some(shadow);
     }
 
     fn restore_spec_undo(&mut self, undo: SpecUndo) {
         if undo.shadow_promotion {
             self.restore_shadow_promotion(undo.previous);
         } else {
-            self.restore(undo.previous);
+            self.restore(*undo.previous);
         }
     }
 
@@ -195,7 +198,7 @@ impl Context<'_> {
             .as_ref()
             .is_some_and(|undo| undo.trigger_lexer_len > target)
         {
-            let undo = *self.replay.spec_undo.take().unwrap();
+            let undo = self.replay.spec_undo.take().unwrap();
             self.restore_spec_undo(undo);
         }
         self.truncate_lexer(target);
@@ -203,21 +206,8 @@ impl Context<'_> {
 
     fn restore_all_spec(&mut self) {
         while let Some(undo) = self.replay.spec_undo.take() {
-            self.restore_spec_undo(*undo);
+            self.restore_spec_undo(undo);
         }
-    }
-
-    fn speculative_bytes(&self, byte: Option<u8>) -> Option<Vec<u8>> {
-        let floor = self
-            .state
-            .trie_lexer_stack
-            .min(self.state.lexer_stack.len());
-        let mut bytes = self.state.lexer_stack[floor..]
-            .iter()
-            .map(|state| state.byte)
-            .collect::<Option<Vec<_>>>()?;
-        bytes.extend(byte);
-        Some(bytes)
     }
 
     fn recover_from_shadow_speculative(
@@ -225,20 +215,29 @@ impl Context<'_> {
         byte: Option<u8>,
         flush_end: bool,
     ) -> Option<bool> {
-        let bytes = self.speculative_bytes(byte)?;
+        let floor = self
+            .state
+            .trie_lexer_stack
+            .min(self.state.lexer_stack.len());
+        let end = self.state.lexer_stack.len();
         let shadow = self.replay.shadow.take()?;
-        let mut previous = Snapshot {
-            state: std::mem::replace(self.state, shadow.state),
-            replay: std::mem::replace(self.replay, shadow.replay),
-        };
-        self.state.shared_box = std::mem::take(&mut previous.state.shared_box);
+        let previous = self.swap_snapshot(shadow);
         self.state.trie_started_inner("greedy_shadow");
 
         let mut ok = true;
-        for &byte in &bytes {
+        for idx in floor..end {
+            let Some(byte) = previous.state.lexer_stack[idx].byte else {
+                ok = false;
+                break;
+            };
             if !self.try_push_speculative(byte) {
                 ok = false;
                 break;
+            }
+        }
+        if ok {
+            if let Some(byte) = byte {
+                ok = self.try_push_speculative(byte);
             }
         }
         if ok && flush_end {
@@ -249,11 +248,11 @@ impl Context<'_> {
             return Some(false);
         }
 
-        let undo = Box::new(SpecUndo {
+        let undo = SpecUndo {
             trigger_lexer_len: self.state.lexer_stack.len(),
             previous,
             shadow_promotion: true,
-        });
+        };
         let mut slot = &mut self.replay.spec_undo;
         while let Some(existing) = slot {
             slot = &mut existing.previous.replay.spec_undo;
@@ -338,7 +337,7 @@ impl Context<'_> {
             return false;
         };
 
-        let previous = self.snapshot();
+        let previous = Box::new(self.snapshot());
         self.truncate_lexer(checkpoint + 1);
         self.state.lexer_stack_top_eos = false;
         self.state.lexer_stack_flush_position = 0;
@@ -360,15 +359,15 @@ impl Context<'_> {
         }
 
         if ok {
-            self.replay.spec_undo = Some(Box::new(SpecUndo {
+            self.replay.spec_undo = Some(SpecUndo {
                 trigger_lexer_len: self.state.lexer_stack.len(),
                 previous,
                 shadow_promotion: false,
-            }));
+            });
             self.state.bias_cache = None;
             true
         } else {
-            self.restore(previous);
+            self.restore(*previous);
             false
         }
     }
