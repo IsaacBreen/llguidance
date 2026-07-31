@@ -752,7 +752,7 @@ impl TokTrie {
 
     /// Return how many tokens and bytes need to chopped off tokens,
     /// so that we do not limit all possible future tokenizations matching the recognizer.
-    pub fn chop_tokens(&self, r: &mut impl Recognizer, tokens: &[TokenId]) -> (usize, usize) {
+    pub fn chop_tokens(&self, r: &mut dyn Recognizer, tokens: &[TokenId]) -> (usize, usize) {
         let max_token_lookback = 4;
         let suff_bytes =
             self.decode_raw(&tokens[tokens.len().saturating_sub(max_token_lookback)..]);
@@ -783,7 +783,7 @@ impl TokTrie {
 
     /// Check if add_bias() would have returned any tokens.
     #[inline(never)]
-    pub fn has_valid_extensions(&self, r: &mut impl Recognizer, start: &[u8]) -> bool {
+    pub fn has_valid_extensions(&self, r: &mut dyn Recognizer, start: &[u8]) -> bool {
         let n = self.child_at_bytes(self.root(), start);
         if n.is_none() {
             return false;

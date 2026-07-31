@@ -10,7 +10,6 @@ use crate::{
 };
 
 use super::parser::ITEM_TRACE;
-type Rec<'a, const G: bool> = ParserRecognizer<'a, G>;
 
 struct TokenizerSlice {
     idx: usize,
@@ -80,8 +79,8 @@ impl TokenizerSlice {
         })
     }
 
-    fn matches<const G: bool>(&self, rec: &mut Rec<'_, G>) -> bool {
-        if self.regex.is_empty() || rec.has_greedy_checkpoint() {
+    fn matches(&self, rec: &mut ParserRecognizer<'_>) -> bool {
+        if self.regex.is_empty() {
             return false;
         }
         // set to at least 500
@@ -97,7 +96,7 @@ impl TokenizerSlice {
         res
     }
 
-    fn trie_apply<const G: bool>(&self, rec: &mut Rec<'_, G>, trg: &mut SimpleVob) {
+    fn trie_apply(&self, rec: &mut ParserRecognizer<'_>, trg: &mut SimpleVob) {
         let t0 = crate::Instant::now();
         self.trie_with_children.add_bias(rec, trg, &[]);
         let us = t0.elapsed().as_micros() as usize;
@@ -106,7 +105,7 @@ impl TokenizerSlice {
 
     // possibly sets bits corresponding to matching tokens in the current slice
     // returns true if it did
-    fn apply<const G: bool>(&self, rec: &mut Rec<'_, G>, trg: &mut SimpleVob) -> bool {
+    fn apply(&self, rec: &mut ParserRecognizer<'_>, trg: &mut SimpleVob) -> bool {
         if self.matches(rec) {
             rec.stats_mut().slices_applied += 1;
             trg.or(&self.mask_trimmed);
@@ -366,8 +365,8 @@ impl SlicedBiasComputer {
     }
 }
 
-impl SlicedBiasComputer {
-    fn compute_bias_with<const G: bool>(&self, rec: &mut Rec<'_, G>, start: &[u8]) -> SimpleVob {
+impl BiasComputer for SlicedBiasComputer {
+    fn compute_bias(&self, rec: &mut ParserRecognizer<'_>, start: &[u8]) -> SimpleVob {
         let mut set = self.trie().alloc_token_set();
         let lexer_state = rec.lexer_state();
         if !self.top_slice.children.is_empty()
@@ -375,25 +374,18 @@ impl SlicedBiasComputer {
             && rec.lexer_mut().subsume_possible(lexer_state)
             && self.top_slice.apply(rec, &mut set)
         {
-            // applied
+            // OK! applied
         } else {
+            // if not top-level applied, or cannot apply, do it by hand
             self.top_slice
                 .trie_with_children
                 .add_bias(rec, &mut set, start);
             debug!("slicer disabled; {} tokens", set.num_set());
         }
+
         debug!("");
+
         set
-    }
-}
-
-impl BiasComputer for SlicedBiasComputer {
-    fn compute_bias(&self, rec: &mut ParserRecognizer<'_>, start: &[u8]) -> SimpleVob {
-        self.compute_bias_with(rec, start)
-    }
-
-    fn compute_bias_greedy(&self, rec: &mut Rec<'_, true>, start: &[u8]) -> SimpleVob {
-        self.compute_bias_with(rec, start)
     }
 
     fn trie(&self) -> &TokTrie {

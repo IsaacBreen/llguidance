@@ -28,10 +28,6 @@ pub enum GrammarInit {
     Internal(Grammar, LexerSpec),
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 /// cbindgen:ignore
 pub const DEFAULT_CONTEXTUAL: bool = true;
 
@@ -59,7 +55,7 @@ pub struct LLGuidanceOptions {
     #[serde(default)]
     pub allow_initial_skip: bool,
 
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub greedy_lexeme_fallback: bool,
 }
 
@@ -90,7 +86,7 @@ pub struct GrammarWithLexer {
     /// The Lark grammar that the grammar should generate.
     /// When this is set, nodes and rx_nodes must be empty.
     pub lark_grammar: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub greedy_lexeme_fallback: bool,
 }
 
