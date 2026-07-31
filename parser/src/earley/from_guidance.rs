@@ -43,16 +43,7 @@ impl CompileCtx {
             bail!("grammar must have either lark_grammar or json_schema");
         };
 
-        // Apply grammar-level options from the serialized grammar JSON.
-        // The JSON compiler hard-codes LLGuidanceOptions::default(), so we
-        // apply the caller's options post-compilation.
-        if input.options.no_forcing {
-            res.builder.regex.spec.no_forcing = true;
-        }
-        if input.options.allow_initial_skip {
-            res.builder.regex.spec.allow_initial_skip = true;
-        }
-        if input.options.greedy_lexeme_fallback {
+        if input.greedy_lexeme_fallback {
             res.builder.regex.spec.greedy_lexeme_fallback = true;
         }
 

@@ -311,15 +311,14 @@ fn test_greedy_fallback_serialized_grammar_option() {
     let n = 80usize;
     let lark = format!(
         r#"
+        %llguidance {{"no_forcing": true}}
         start: T S
         T: /a|ab{{{n}}}c/
         S: /b{{{n}}}d/
     "#
     );
     let mut grammar = TopLevelGrammar::from_lark(lark);
-    let options = &mut grammar.grammars[0].options;
-    options.no_forcing = true;
-    options.greedy_lexeme_fallback = true;
+    grammar.grammars[0].greedy_lexeme_fallback = true;
 
     let mut parser = get_parser_factory().create_parser(grammar).unwrap();
     parser.start_without_prompt();
