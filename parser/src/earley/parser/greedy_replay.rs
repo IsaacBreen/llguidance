@@ -65,9 +65,36 @@ impl Context<'_> {
     }
 
     fn latest_accepting(&mut self) -> Option<(usize, PreLexeme, Vec<u8>)> {
+        let top = self.state.lexer_state();
+
+        // Speculative candidates are short tokenizer paths. Scan only the
+        // bytes added by the current trie traversal; committed history is
+        // tracked incrementally below.
+        if !self.state.scratch.definitive {
+            let floor = self
+                .state
+                .trie_lexer_stack
+                .min(self.state.lexer_stack.len());
+            for idx in (floor..self.state.lexer_stack.len()).rev() {
+                let item = self.state.lexer_stack[idx];
+                if item.row_idx != top.row_idx {
+                    break;
+                }
+                if let LexerResult::Lexeme(pre) =
+                    self.state.lexer_mut().try_lexeme_end(item.lexer_state)
+                {
+                    let replay = self.state.lexer_stack[idx + 1..]
+                        .iter()
+                        .map(|state| state.byte)
+                        .collect::<Option<Vec<_>>>()?;
+                    return Some((idx, pre, replay));
+                }
+            }
+        }
+
         let idx = *self.replay.accepting.last()?;
         let item = *self.state.lexer_stack.get(idx)?;
-        if item.row_idx != self.state.lexer_state().row_idx {
+        if item.row_idx != top.row_idx {
             return None;
         }
         let LexerResult::Lexeme(pre) = self.state.lexer_mut().try_lexeme_end(item.lexer_state)
@@ -94,6 +121,9 @@ impl Context<'_> {
     }
 
     fn record_top_if_accepting(&mut self) {
+        if !self.state.scratch.definitive {
+            return;
+        }
         let idx = self.state.lexer_stack.len() - 1;
         let lexer_state = self.state.lexer_stack[idx].lexer_state;
         if matches!(
@@ -345,7 +375,7 @@ pub(super) fn has_checkpoint(state: &ParserState) -> bool {
 }
 
 pub(super) fn record_top_if_accepting(state: &mut ParserState) {
-    if state.greedy_replay.is_none() {
+    if state.greedy_replay.is_none() || !state.scratch.definitive {
         return;
     }
     let idx = state.lexer_stack.len() - 1;
