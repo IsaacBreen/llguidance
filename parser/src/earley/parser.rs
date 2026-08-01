@@ -1746,7 +1746,7 @@ impl ParserState {
         if self.is_accepting() {
             return None;
         }
-        let mut recognizer = greedy_replay::fork_recognizer(self);
+        let mut recognizer = greedy_replay::ForkRecognizer::new(self);
         recognizer.trie_started("forced_byte");
         let forced = {
             let mut allowed = (u8::MIN..=u8::MAX).filter(|&byte| recognizer.byte_allowed(byte));

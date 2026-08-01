@@ -321,10 +321,6 @@ pub(super) fn visit_forks(state: &mut ParserState, mut f: impl FnMut(&mut Parser
     }
 }
 
-pub(super) fn fork_recognizer(state: &mut ParserState) -> impl Recognizer + '_ {
-    ForkRecognizer::new(state)
-}
-
 pub(super) fn chop_tokens(
     state: &mut ParserState,
     trie: &TokTrie,
@@ -345,13 +341,14 @@ pub(super) fn validate_tokens(state: &mut ParserState, tokens: &[TokenId]) -> us
     valid
 }
 
-struct ForkRecognizer {
+pub(super) struct ForkRecognizer {
     branches: Vec<ParserState>,
     history: Vec<Vec<ParserState>>,
 }
 
 impl ForkRecognizer {
-    fn new(state: &mut ParserState) -> Self {
+    #[inline(always)]
+    pub(super) fn new(state: &mut ParserState) -> Self {
         let mut branches = vec![state.clone()];
         branches.extend(forks(state));
         branches
