@@ -307,6 +307,7 @@ impl Context<'_> {
     }
 }
 
+#[inline(never)]
 pub(super) fn forks(state: &mut ParserState) -> Vec<ParserState> {
     let mut forks = Vec::new();
     if state.shared_box.greedy_replay.is_some() {
