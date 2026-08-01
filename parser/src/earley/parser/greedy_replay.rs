@@ -347,7 +347,6 @@ pub(super) struct ForkRecognizer {
 }
 
 impl ForkRecognizer {
-    #[inline(always)]
     pub(super) fn new(state: &mut ParserState) -> Self {
         let mut branches = vec![state.clone()];
         branches.extend(forks(state));
