@@ -44,7 +44,6 @@ impl CompileCtx {
         };
 
         res.builder.regex.spec.greedy_lexeme_fallback |= input.greedy_lexeme_fallback;
-
         res.builder.check_limits()?;
 
         let grammar_id = res.builder.grammar.sym_props(res.start_node).grammar_id;

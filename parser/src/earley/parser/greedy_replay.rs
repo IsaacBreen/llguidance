@@ -320,3 +320,91 @@ pub(super) fn visit_forks(state: &mut ParserState, mut f: impl FnMut(&mut Parser
         with(state, |replay| replay.visit_forks(&mut f));
     }
 }
+
+pub(super) fn forced_byte(state: &mut ParserState) -> Option<u8> {
+    if state.is_accepting() {
+        return None;
+    }
+    let mut recognizer = ForkRecognizer::new(state);
+    recognizer.trie_started("forced_byte");
+    let mut allowed = (u8::MIN..=u8::MAX).filter(|&byte| recognizer.byte_allowed(byte));
+    let forced = allowed.next().filter(|_| allowed.next().is_none());
+    recognizer.trie_finished();
+    forced
+}
+
+pub(super) fn chop_tokens(
+    state: &mut ParserState,
+    trie: &TokTrie,
+    tokens: &[TokenId],
+) -> (usize, usize) {
+    if state.shared_box.greedy_replay.is_none() {
+        trie.chop_tokens(&mut ParserRecognizer { state }, tokens)
+    } else {
+        trie.chop_tokens(&mut ForkRecognizer::new(state), tokens)
+    }
+}
+
+pub(super) fn validate_tokens(state: &mut ParserState, tokens: &[TokenId]) -> usize {
+    let mut valid = state.validate_tokens(tokens);
+    visit_forks(state, |branch| {
+        valid = valid.max(branch.validate_tokens(tokens));
+    });
+    valid
+}
+
+struct ForkRecognizer {
+    branches: Vec<ParserState>,
+    history: Vec<Vec<ParserState>>,
+}
+
+impl ForkRecognizer {
+    fn new(state: &mut ParserState) -> Self {
+        let mut branches = vec![state.clone()];
+        branches.extend(forks(state));
+        branches
+            .iter_mut()
+            .for_each(|state| state.shared_box.greedy_replay = None);
+        Self {
+            branches,
+            history: vec![],
+        }
+    }
+}
+
+impl Recognizer for ForkRecognizer {
+    fn pop_bytes(&mut self, num: usize) {
+        if num != 0 {
+            let target = self.history.len() - num;
+            self.branches = self.history.split_off(target).remove(0);
+        }
+    }
+
+    fn collapse(&mut self) {}
+
+    fn trie_started(&mut self, label: &str) {
+        self.branches
+            .iter_mut()
+            .for_each(|state| state.trie_started_inner(label));
+    }
+
+    fn trie_finished(&mut self) {
+        self.branches
+            .iter_mut()
+            .for_each(ParserState::trie_finished_inner);
+        self.history.clear();
+    }
+
+    fn try_push_byte(&mut self, byte: u8) -> bool {
+        let previous = self.branches.clone();
+        self.branches
+            .retain_mut(|state| ParserRecognizer { state }.try_push_byte(byte));
+        if self.branches.is_empty() {
+            self.branches = previous;
+            false
+        } else {
+            self.history.push(previous);
+            true
+        }
+    }
+}
