@@ -320,3 +320,210 @@ pub(super) fn visit_forks(state: &mut ParserState, mut f: impl FnMut(&mut Parser
         with(state, |replay| replay.visit_forks(&mut f));
     }
 }
+
+#[inline(always)]
+pub(super) fn enabled(state: &ParserState) -> bool {
+    state.shared_box.greedy_replay.is_some()
+}
+
+#[inline(always)]
+pub(super) fn compute_bias(
+    state: &mut ParserState,
+    computer: &dyn BiasComputer,
+    start: &[u8],
+) -> SimpleVob {
+    let mut set = computer.compute_bias(&mut ParserRecognizer { state }, start);
+    visit_forks(state, |branch| {
+        set.or(&computer.compute_bias(&mut ParserRecognizer { state: branch }, start));
+    });
+    set
+}
+
+pub(super) fn accepting_allows_eos(state: &mut ParserState) -> bool {
+    enabled(state) && with(state, |replay| replay.accepting_allows_eos())
+}
+
+pub(super) fn prepare_rollback(state: &mut ParserState, target: usize) {
+    if enabled(state) {
+        with(state, |replay| replay.prepare_rollback(target));
+    }
+}
+
+pub(super) fn forced_byte_committed(state: &mut ParserState, byte: u8) {
+    if enabled(state) {
+        with(state, |replay| replay.forced_byte_committed(byte));
+    }
+}
+
+pub(super) fn recover(
+    state: &mut ParserState,
+    byte: Option<u8>,
+    flush_end: bool,
+) -> Option<(bool, usize)> {
+    enabled(state).then(|| with(state, |replay| replay.recover(byte, flush_end)))
+}
+
+#[inline(always)]
+pub(super) fn recover_flush(state: &mut ParserState, flushed: bool) -> bool {
+    if flushed || !state.scratch.definitive {
+        flushed
+    } else {
+        recover(state, None, true).is_some_and(|result| result.0)
+    }
+}
+
+#[inline(always)]
+pub(super) fn is_accepting(state: &mut ParserState) -> bool {
+    let mut accepting = state.run_speculative("is_accepting", |state| state.is_accepting_inner());
+    if !accepting {
+        visit_forks(state, |branch| {
+            if !accepting {
+                accepting = branch
+                    .run_speculative("greedy_is_accepting", |state| state.is_accepting_inner());
+            }
+        });
+    }
+    accepting
+}
+
+#[inline(always)]
+pub(super) fn forced_byte(state: &mut ParserState) -> Option<Option<u8>> {
+    if !enabled(state) {
+        return None;
+    }
+    if is_accepting(state) {
+        return Some(None);
+    }
+    let mut recognizer = ForkRecognizer::new(state);
+    recognizer.trie_started("forced_byte");
+    let mut allowed = (u8::MIN..=u8::MAX).filter(|&byte| recognizer.byte_allowed(byte));
+    let forced = allowed.next().filter(|_| allowed.next().is_none());
+    recognizer.trie_finished();
+    Some(forced)
+}
+
+pub(super) fn recognizer(state: &mut ParserState) -> ParserRecognizer<'_> {
+    assert!(
+        !enabled(state),
+        "with_recognizer is unavailable with greedy_lexeme_fallback"
+    );
+    ParserRecognizer { state }
+}
+
+pub(super) fn chop_tokens(
+    state: &mut ParserState,
+    trie: &TokTrie,
+    tokens: &[TokenId],
+) -> (usize, usize) {
+    if enabled(state) {
+        trie.chop_tokens(&mut ForkRecognizer::new(state), tokens)
+    } else {
+        trie.chop_tokens(&mut ParserRecognizer { state }, tokens)
+    }
+}
+
+#[inline(always)]
+pub(super) fn apply_token(state: &mut ParserState, bytes: &[u8], token: TokenId) -> Result<usize> {
+    let result = state.apply_token(bytes, token);
+    state.token_idx += 1;
+    if enabled(state) {
+        with(state, |replay| {
+            if matches!(result, Ok(0)) {
+                replay.token_committed(bytes, token);
+            } else {
+                replay.discard_frontier();
+            }
+        });
+    }
+    result
+}
+
+#[inline(always)]
+pub(super) fn with_shared<T>(
+    state: &mut ParserState,
+    shared: &mut Box<SharedState>,
+    f: impl FnOnce(&mut ParserState) -> T,
+) -> T {
+    let greedy = enabled(state);
+    std::mem::swap(&mut state.shared_box, shared);
+    if greedy {
+        std::mem::swap(
+            &mut state.shared_box.greedy_replay,
+            &mut shared.greedy_replay,
+        );
+    }
+    let result = f(state);
+    if greedy {
+        std::mem::swap(
+            &mut state.shared_box.greedy_replay,
+            &mut shared.greedy_replay,
+        );
+    }
+    std::mem::swap(&mut state.shared_box, shared);
+    assert!(shared.lexer_opt.is_some());
+    result
+}
+
+pub(super) fn validate_tokens(state: &mut ParserState, tokens: &[TokenId]) -> usize {
+    let mut valid = state.validate_tokens(tokens);
+    visit_forks(state, |branch| {
+        valid = valid.max(branch.validate_tokens(tokens));
+    });
+    valid
+}
+
+struct ForkRecognizer {
+    branches: Vec<ParserState>,
+    history: Vec<Vec<ParserState>>,
+}
+
+impl ForkRecognizer {
+    fn new(state: &mut ParserState) -> Self {
+        let mut branches = vec![state.clone()];
+        branches.extend(forks(state));
+        branches
+            .iter_mut()
+            .for_each(|state| state.shared_box.greedy_replay = None);
+        Self {
+            branches,
+            history: vec![],
+        }
+    }
+}
+
+impl Recognizer for ForkRecognizer {
+    fn pop_bytes(&mut self, num: usize) {
+        if num != 0 {
+            let target = self.history.len() - num;
+            self.branches = self.history.split_off(target).remove(0);
+        }
+    }
+
+    fn collapse(&mut self) {}
+
+    fn trie_started(&mut self, label: &str) {
+        self.branches
+            .iter_mut()
+            .for_each(|state| state.trie_started_inner(label));
+    }
+
+    fn trie_finished(&mut self) {
+        self.branches
+            .iter_mut()
+            .for_each(ParserState::trie_finished_inner);
+        self.history.clear();
+    }
+
+    fn try_push_byte(&mut self, byte: u8) -> bool {
+        let previous = self.branches.clone();
+        self.branches
+            .retain_mut(|state| ParserRecognizer { state }.try_push_byte(byte));
+        if self.branches.is_empty() {
+            self.branches = previous;
+            false
+        } else {
+            self.history.push(previous);
+            true
+        }
+    }
+}
