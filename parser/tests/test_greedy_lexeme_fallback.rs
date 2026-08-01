@@ -2,7 +2,7 @@ use llg_test_utils::*;
 use llguidance::api::{LLGuidanceOptions, TopLevelGrammar};
 
 #[test]
-fn test_greedy_checkpoint_recovers_after_unfinished_longer_attempt() {
+fn test_greedy_fallback_recovers_after_unfinished_longer_attempt() {
     lark_str_test_many(
         r#"
             %llguidance {"no_forcing": true, "greedy_lexeme_fallback": true}
@@ -16,7 +16,7 @@ fn test_greedy_checkpoint_recovers_after_unfinished_longer_attempt() {
 }
 
 #[test]
-fn test_greedy_checkpoint_is_still_global_maximal_munch() {
+fn test_greedy_fallback_preserves_global_maximal_munch() {
     lark_str_test_many(
         r#"
             %llguidance {"no_forcing": true, "greedy_lexeme_fallback": true}
@@ -32,7 +32,7 @@ fn test_greedy_checkpoint_is_still_global_maximal_munch() {
 }
 
 #[test]
-fn test_greedy_checkpoint_contextual_ipv6() {
+fn test_greedy_fallback_contextual_ipv6() {
     lark_str_test_many(
         r#"
             %llguidance {"no_forcing": true, "greedy_lexeme_fallback": true}
@@ -48,7 +48,7 @@ fn test_greedy_checkpoint_contextual_ipv6() {
 }
 
 #[test]
-fn test_greedy_checkpoint_fstring_chunk() {
+fn test_greedy_fallback_fstring_chunk() {
     lark_str_test_many(
         r#"
             %llguidance {"no_forcing": true, "greedy_lexeme_fallback": true}
@@ -62,7 +62,7 @@ fn test_greedy_checkpoint_fstring_chunk() {
 }
 
 #[test]
-fn test_greedy_checkpoint_at_eos() {
+fn test_greedy_fallback_at_eos() {
     lark_str_test_many(
         r#"
             %llguidance {"no_forcing": true, "greedy_lexeme_fallback": true}
@@ -102,7 +102,7 @@ fn test_greedy_fallback_accepting_boundary_preserves_state() {
 }
 
 #[test]
-fn test_greedy_shadow_long_checkpoint() {
+fn test_greedy_fallback_after_long_lookahead() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -117,7 +117,7 @@ fn test_greedy_shadow_long_checkpoint() {
 }
 
 #[test]
-fn test_greedy_shadow_nested_checkpoint_chain() {
+fn test_greedy_fallback_across_nested_boundaries() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -143,7 +143,7 @@ fn test_greedy_shadow_nested_checkpoint_chain() {
 }
 
 #[test]
-fn test_greedy_shadow_promotes_at_eos() {
+fn test_greedy_fallback_accepts_at_eos_after_long_lookahead() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -171,7 +171,7 @@ fn feed_greedy_text(parser: &mut llguidance::TokenParser, text: &str) {
 }
 
 #[test]
-fn test_greedy_shadow_capture_after_promotion() {
+fn test_greedy_fallback_preserves_capture() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -190,7 +190,7 @@ fn test_greedy_shadow_capture_after_promotion() {
 }
 
 #[test]
-fn test_greedy_shadow_rollback_and_rebuild() {
+fn test_greedy_fallback_rollback_and_rebuild() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -212,7 +212,7 @@ fn test_greedy_shadow_rollback_and_rebuild() {
 }
 
 #[test]
-fn test_greedy_shadow_deep_clone_diverges_cleanly() {
+fn test_greedy_fallback_deep_clone_diverges_cleanly() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -234,7 +234,7 @@ fn test_greedy_shadow_deep_clone_diverges_cleanly() {
 }
 
 #[test]
-fn test_greedy_shadow_shared_lexer_clone_diverges_cleanly() {
+fn test_greedy_fallback_shared_lexer_clone_diverges_cleanly() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -256,7 +256,7 @@ fn test_greedy_shadow_shared_lexer_clone_diverges_cleanly() {
 }
 
 #[test]
-fn test_greedy_shadow_validate_tokens_restores_state() {
+fn test_greedy_fallback_validate_tokens_restores_state() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -278,7 +278,7 @@ fn test_greedy_shadow_validate_tokens_restores_state() {
 }
 
 #[test]
-fn test_greedy_shadow_with_forcing_enabled() {
+fn test_greedy_fallback_with_forcing_enabled() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -293,7 +293,7 @@ fn test_greedy_shadow_with_forcing_enabled() {
 }
 
 #[test]
-fn test_greedy_shadow_with_stop_suffix_and_max_tokens() {
+fn test_greedy_fallback_with_stop_suffix_and_max_tokens() {
     let n = 80usize;
     let prefix = format!("a{}d", "b".repeat(n));
 
@@ -355,7 +355,7 @@ fn test_greedy_fallback_false_is_not_serialized() {
 }
 
 #[test]
-fn test_greedy_shadow_rollback_across_promotion_then_take_long_match() {
+fn test_greedy_fallback_rollback_then_take_long_match() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -392,7 +392,7 @@ fn test_greedy_shadow_rollback_across_promotion_then_take_long_match() {
 }
 
 #[test]
-fn test_greedy_shadow_rollback_across_eos_promotion() {
+fn test_greedy_fallback_rollback_after_eos() {
     let n = 80usize;
     let grammar = format!(
         r#"
@@ -418,7 +418,7 @@ fn test_greedy_shadow_rollback_across_eos_promotion() {
 }
 
 #[test]
-fn test_greedy_shadow_rollback_across_multiple_promotions() {
+fn test_greedy_fallback_rollback_across_multiple_fallbacks() {
     let n = 80usize;
     let grammar = format!(
         r#"

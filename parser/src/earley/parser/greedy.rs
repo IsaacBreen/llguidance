@@ -1,4 +1,12 @@
-use super::*;
+//! Greedy lexeme fallback support.
+//!
+//! The normal lexer keeps consuming the longest possible lexeme. If that
+//! choice later makes the grammar impossible, this module retains an
+//! alternative parser state at the latest earlier accepting lexeme boundary.
+//! That alternative is used for masks, validation, EOS checks, and recovery,
+//! and fallback logic is skipped entirely when the option is off.
+
+use super::{LexerResult, ParserRecognizer, ParserState, PreLexeme, Recognizer, TokenId};
 
 #[derive(Clone)]
 struct Snapshot {
@@ -28,21 +36,26 @@ impl Commit<'_> {
 
 #[derive(Clone, Default)]
 pub(super) struct GreedyReplay {
+    // State before a fallback was promoted, retained so rollback can restore it.
     promotion: Option<Box<Snapshot>>,
+    // Latest accepting lexer-stack position in the current parser row.
     source: Option<usize>,
+    // Lexer-stack prefix already searched for an accepting position.
     checked: usize,
+    // Whether the alternate state for `source` has already been attempted.
     frontier_tried: bool,
+    // Parser state obtained by ending the lexeme at `source`.
     frontier: Option<Box<Snapshot>>,
 }
 
-pub(super) struct Context<'a> {
+struct ReplayContext<'a> {
     state: &'a mut ParserState,
     replay: &'a mut GreedyReplay,
 }
 
-pub(super) fn with<T>(state: &mut ParserState, f: impl FnOnce(&mut Context<'_>) -> T) -> T {
+fn with<T>(state: &mut ParserState, f: impl FnOnce(&mut ReplayContext<'_>) -> T) -> T {
     let mut replay = *state.shared_box.greedy_replay.take().unwrap();
-    let result = f(&mut Context {
+    let result = f(&mut ReplayContext {
         state,
         replay: &mut replay,
     });
@@ -50,6 +63,8 @@ pub(super) fn with<T>(state: &mut ParserState, f: impl FnOnce(&mut Context<'_>) 
     result
 }
 
+// ParserState clones do not own the shared lexer. Move it into a snapshot only
+// for the duration of an operation, then return it to the live state.
 fn with_snapshot<T>(
     owner: &mut ParserState,
     snapshot: &mut Snapshot,
@@ -63,7 +78,7 @@ fn with_snapshot<T>(
     result
 }
 
-impl Context<'_> {
+impl ReplayContext<'_> {
     fn snapshot_with(&mut self, replay: GreedyReplay) -> Snapshot {
         let shared = std::mem::take(&mut self.state.shared_box);
         let state = self.state.clone();
@@ -157,7 +172,7 @@ impl Context<'_> {
         Some((true, backtrack))
     }
 
-    pub(super) fn recover(&mut self, byte: Option<u8>, flush_end: bool) -> (bool, usize) {
+    fn recover(&mut self, byte: Option<u8>, flush_end: bool) -> (bool, usize) {
         self.try_recover(byte, flush_end).unwrap_or((false, 0))
     }
 
@@ -247,15 +262,15 @@ impl Context<'_> {
         self.refresh_frontier();
     }
 
-    pub(super) fn token_committed(&mut self, bytes: &[u8], token: TokenId) {
+    fn token_committed(&mut self, bytes: &[u8], token: TokenId) {
         self.committed(Commit::Token(bytes, token));
     }
 
-    pub(super) fn forced_byte_committed(&mut self, byte: u8) {
+    fn forced_byte_committed(&mut self, byte: u8) {
         self.committed(Commit::Byte(byte));
     }
 
-    pub(super) fn discard_frontier(&mut self) {
+    fn discard_frontier(&mut self) {
         self.replay.source = None;
         self.replay.checked = 0;
         self.replay.frontier_tried = false;
@@ -291,7 +306,7 @@ impl Context<'_> {
         });
     }
 
-    pub(super) fn accepting_allows_eos(&mut self) -> bool {
+    fn accepting_allows_eos(&mut self) -> bool {
         self.refresh_source();
         self.replay.source.is_some_and(|idx| {
             let item = self.state.lexer_stack[idx];
@@ -299,7 +314,7 @@ impl Context<'_> {
         })
     }
 
-    pub(super) fn prepare_rollback(&mut self, target: usize) {
+    fn prepare_rollback(&mut self, target: usize) {
         while let Some(undo) = self.replay.promotion.take_if(|undo| target < undo.trigger) {
             self.restore(undo);
         }
@@ -318,5 +333,89 @@ pub(super) fn forks(state: &mut ParserState) -> Vec<ParserState> {
 pub(super) fn visit_forks(state: &mut ParserState, mut f: impl FnMut(&mut ParserState)) {
     if state.shared_box.greedy_replay.is_some() {
         with(state, |replay| replay.visit_forks(&mut f));
+    }
+}
+
+pub(super) struct ForkRecognizer {
+    branches: Vec<ParserState>,
+    history: Vec<Vec<ParserState>>,
+}
+
+impl ForkRecognizer {
+    pub(super) fn new(state: &mut ParserState) -> Self {
+        let mut branches = vec![state.clone()];
+        branches.extend(forks(state));
+        for branch in &mut branches {
+            branch.shared_box.greedy_replay = None;
+        }
+        Self {
+            branches,
+            history: vec![],
+        }
+    }
+}
+
+impl Recognizer for ForkRecognizer {
+    fn pop_bytes(&mut self, num: usize) {
+        if num != 0 {
+            let target = self.history.len() - num;
+            self.branches = self.history.split_off(target).remove(0);
+        }
+    }
+    fn collapse(&mut self) {}
+    fn trie_started(&mut self, label: &str) {
+        for branch in &mut self.branches {
+            branch.trie_started_inner(label);
+        }
+    }
+    fn trie_finished(&mut self) {
+        for branch in &mut self.branches {
+            branch.trie_finished_inner();
+        }
+        self.history.clear();
+    }
+    fn try_push_byte(&mut self, byte: u8) -> bool {
+        let previous = self.branches.clone();
+        self.branches
+            .retain_mut(|state| ParserRecognizer { state }.try_push_byte(byte));
+        if self.branches.is_empty() {
+            self.branches = previous;
+            false
+        } else {
+            self.history.push(previous);
+            true
+        }
+    }
+}
+
+#[inline(always)]
+pub(super) fn recover(state: &mut ParserState, byte: Option<u8>, flush_end: bool) -> (bool, usize) {
+    with(state, |replay| replay.recover(byte, flush_end))
+}
+
+#[inline(always)]
+pub(super) fn forced_byte_committed(state: &mut ParserState, byte: u8) {
+    with(state, |replay| replay.forced_byte_committed(byte));
+}
+
+#[inline(always)]
+pub(super) fn token_committed(state: &mut ParserState, bytes: &[u8], token: TokenId) {
+    with(state, |replay| replay.token_committed(bytes, token));
+}
+
+#[inline(always)]
+pub(super) fn discard_frontier(state: &mut ParserState) {
+    with(state, |replay| replay.discard_frontier());
+}
+
+#[inline(always)]
+pub(super) fn accepting_allows_eos(state: &mut ParserState) -> bool {
+    state.shared_box.greedy_replay.is_some() && with(state, |replay| replay.accepting_allows_eos())
+}
+
+#[inline(always)]
+pub(super) fn prepare_rollback(state: &mut ParserState, target: usize) {
+    if state.shared_box.greedy_replay.is_some() {
+        with(state, |replay| replay.prepare_rollback(target));
     }
 }

@@ -31,6 +31,10 @@ pub enum GrammarInit {
 /// cbindgen:ignore
 pub const DEFAULT_CONTEXTUAL: bool = true;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// In lark syntax, this can be specified as JSON object after '%llguidance' declaration in the grammar.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LLGuidanceOptions {
@@ -54,7 +58,9 @@ pub struct LLGuidanceOptions {
     /// including nested sub-grammars.
     #[serde(default)]
     pub allow_initial_skip: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// If a greedy lexeme later reaches a dead end, retry from the latest
+    /// earlier accepting lexeme boundary.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub greedy_lexeme_fallback: bool,
 }
 
@@ -87,7 +93,8 @@ pub struct GrammarWithLexer {
     pub lark_grammar: Option<String>,
     // #[serde(flatten)]
     // pub options: LLGuidanceOptions,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Enable greedy lexeme fallback for this serialized grammar.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub greedy_lexeme_fallback: bool,
 }
 
