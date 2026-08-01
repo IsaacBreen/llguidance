@@ -321,16 +321,8 @@ pub(super) fn visit_forks(state: &mut ParserState, mut f: impl FnMut(&mut Parser
     }
 }
 
-pub(super) fn forced_byte(state: &mut ParserState) -> Option<u8> {
-    if state.is_accepting() {
-        return None;
-    }
-    let mut recognizer = ForkRecognizer::new(state);
-    recognizer.trie_started("forced_byte");
-    let mut allowed = (u8::MIN..=u8::MAX).filter(|&byte| recognizer.byte_allowed(byte));
-    let forced = allowed.next().filter(|_| allowed.next().is_none());
-    recognizer.trie_finished();
-    forced
+pub(super) fn fork_recognizer(state: &mut ParserState) -> impl Recognizer + '_ {
+    ForkRecognizer::new(state)
 }
 
 pub(super) fn chop_tokens(

@@ -1666,7 +1666,7 @@ impl ParserState {
     /// no such byte, forced_byte() returns 'None'.
     fn forced_byte(&mut self) -> Option<u8> {
         if self.shared_box.greedy_replay.is_some() {
-            return greedy_replay::forced_byte(self);
+            return self.greedy_forced_byte();
         }
         if self.is_accepting() {
             debug!("  in accept state, not forcing");
@@ -1740,6 +1740,20 @@ impl ParserState {
 
     fn restore_state(&mut self, state: SavedParserState) {
         self.lexer_stack.truncate(state.lexer_stack_length);
+    }
+
+    fn greedy_forced_byte(&mut self) -> Option<u8> {
+        if self.is_accepting() {
+            return None;
+        }
+        let mut recognizer = greedy_replay::fork_recognizer(self);
+        recognizer.trie_started("forced_byte");
+        let forced = {
+            let mut allowed = (u8::MIN..=u8::MAX).filter(|&byte| recognizer.byte_allowed(byte));
+            allowed.next().filter(|_| allowed.next().is_none())
+        };
+        recognizer.trie_finished();
+        forced
     }
 
     /// Advance the parser as if the current lexeme (if any)
