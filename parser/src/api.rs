@@ -54,6 +54,9 @@ pub struct LLGuidanceOptions {
     /// including nested sub-grammars.
     #[serde(default)]
     pub allow_initial_skip: bool,
+
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub greedy_lexeme_fallback: bool,
 }
 
 impl LLGuidanceOptions {
@@ -67,6 +70,7 @@ impl LLGuidanceOptions {
         if other.allow_initial_skip {
             self.allow_initial_skip = true;
         }
+        self.greedy_lexeme_fallback |= other.greedy_lexeme_fallback;
     }
 }
 
@@ -82,8 +86,8 @@ pub struct GrammarWithLexer {
     /// The Lark grammar that the grammar should generate.
     /// When this is set, nodes and rx_nodes must be empty.
     pub lark_grammar: Option<String>,
-    // #[serde(flatten)]
-    // pub options: LLGuidanceOptions,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub greedy_lexeme_fallback: bool,
 }
 
 impl Debug for GrammarWithLexer {

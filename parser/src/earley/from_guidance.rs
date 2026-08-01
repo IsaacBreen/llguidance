@@ -22,7 +22,7 @@ impl CompileCtx {
     fn run_one(&mut self, input: GrammarWithLexer) -> Result<(SymIdx, LexemeClass)> {
         let builder = std::mem::take(&mut self.builder).unwrap();
 
-        let res = if let Some(lark) = input.lark_grammar {
+        let mut res = if let Some(lark) = input.lark_grammar {
             #[cfg(feature = "lark")]
             {
                 use crate::lark::lark_to_llguidance;
@@ -42,6 +42,8 @@ impl CompileCtx {
         } else {
             bail!("grammar must have either lark_grammar or json_schema");
         };
+
+        res.builder.regex.spec.greedy_lexeme_fallback |= input.greedy_lexeme_fallback;
 
         res.builder.check_limits()?;
 

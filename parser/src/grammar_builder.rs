@@ -236,6 +236,7 @@ impl GrammarBuilder {
         if options.allow_initial_skip {
             self.regex.spec.allow_initial_skip = true;
         }
+        self.regex.spec.greedy_lexeme_fallback |= options.greedy_lexeme_fallback;
 
         // add root node
         self.curr_start_idx = self.new_node("start");
