@@ -761,7 +761,7 @@ impl ParserState {
     fn compute_bias(&mut self, computer: &dyn BiasComputer, start: &[u8]) -> SimpleVob {
         let t0 = Instant::now();
 
-        let cacheable = start.is_empty() && !greedy_replay::enabled(self);
+        let cacheable = start.is_empty() && self.shared_box.greedy_replay.is_none();
         // Check cache - only valid when start is empty (common case)
         if cacheable {
             let curr_state = self.lexer_state();
@@ -786,7 +786,12 @@ impl ParserState {
         dfa.set_max_states(limits.max_lexer_states);
 
         let mut set = self.with_items_limit(limits.step_max_items, "mask", |state| {
-            greedy_replay::compute_bias(state, computer, start)
+            if state.shared_box.greedy_replay.is_none() {
+                let mut recognizer = ParserRecognizer { state };
+                computer.compute_bias(&mut recognizer, start)
+            } else {
+                greedy_replay::compute_bias(state, computer, start)
+            }
         });
 
         self.stats.lexer_cost = self.lexer().dfa.total_fuel_spent();
@@ -889,7 +894,9 @@ impl ParserState {
     pub fn lexer_allows_eos(&mut self) -> bool {
         if self.has_pending_lexeme_bytes() {
             let lexer_state = self.lexer_state().lexer_state;
-            self.lexer_mut().allows_eos(lexer_state) || greedy_replay::accepting_allows_eos(self)
+            self.lexer_mut().allows_eos(lexer_state)
+                || (self.shared_box.greedy_replay.is_some()
+                    && greedy_replay::with(self, |replay| replay.accepting_allows_eos()))
         } else {
             // empty lexemes are not allowed
             false
@@ -1025,7 +1032,9 @@ impl ParserState {
         );
 
         let new_len = self.byte_to_token_idx.len() - n_bytes;
-        greedy_replay::prepare_rollback(self, new_len);
+        if self.shared_box.greedy_replay.is_some() {
+            greedy_replay::with(self, |replay| replay.prepare_rollback(new_len));
+        }
 
         self.byte_to_token_idx.truncate(new_len);
         self.bytes.truncate(new_len);
@@ -1415,7 +1424,9 @@ impl ParserState {
                                 all_ok = false;
                                 break;
                             }
-                            greedy_replay::forced_byte_committed(s, b);
+                            if s.shared_box.greedy_replay.is_some() {
+                                greedy_replay::with(s, |replay| replay.forced_byte_committed(b));
+                            }
                         }
 
                         if !all_ok {
@@ -1441,7 +1452,9 @@ impl ParserState {
                     debug!("  force_bytes reject {}", b as char);
                     break;
                 }
-                greedy_replay::forced_byte_committed(s, b);
+                if s.shared_box.greedy_replay.is_some() {
+                    greedy_replay::with(s, |replay| replay.forced_byte_committed(b));
+                }
             }
         });
         self.assert_definitive();
@@ -1572,7 +1585,11 @@ impl ParserState {
     }
 
     pub fn is_accepting(&mut self) -> bool {
-        greedy_replay::is_accepting(self)
+        if self.shared_box.greedy_replay.is_some() {
+            greedy_replay::is_accepting(self)
+        } else {
+            self.run_speculative("is_accepting", |s| s.is_accepting_inner())
+        }
     }
 
     // try_push_byte_definitive() attempts to 'push' a byte (that is advance
@@ -1618,8 +1635,8 @@ impl ParserState {
                 self.bytes.truncate(self.bytes.len() - bt);
             }
             (true, bt)
-        } else if lexer_error {
-            greedy_replay::recover(self, byte, byte.is_none()).unwrap_or((false, 0))
+        } else if lexer_error && self.shared_box.greedy_replay.is_some() {
+            greedy_replay::with(self, |replay| replay.recover(byte, byte.is_none()))
         } else {
             (false, 0)
         }
@@ -1635,8 +1652,8 @@ impl ParserState {
     /// parser at this point, and returns it.  If there is
     /// no such byte, forced_byte() returns 'None'.
     fn forced_byte(&mut self) -> Option<u8> {
-        if let Some(forced) = greedy_replay::forced_byte(self) {
-            return forced;
+        if self.shared_box.greedy_replay.is_some() {
+            return greedy_replay::forced_byte(self);
         }
         if self.is_accepting() {
             debug!("  in accept state, not forcing");
@@ -1729,7 +1746,11 @@ impl ParserState {
             self.lexer_stack_flush_position = prev_len;
         }
         assert!(self.backtrack_byte_count == 0);
-        greedy_replay::recover_flush(self, r)
+        if r || self.shared_box.greedy_replay.is_none() || !self.scratch.definitive {
+            r
+        } else {
+            greedy_replay::with(self, |replay| replay.recover(None, true).0)
+        }
     }
 
     pub fn scan_eos(&mut self) -> bool {
@@ -2794,10 +2815,11 @@ impl Parser {
     }
 
     pub fn with_recognizer<T>(&mut self, f: impl FnOnce(&mut ParserRecognizer) -> T) -> T {
-        self.with_shared(|state| {
-            let mut rec = greedy_replay::recognizer(state);
-            f(&mut rec)
-        })
+        assert!(
+            self.state.shared_box.greedy_replay.is_none(),
+            "with_recognizer is unavailable with greedy_lexeme_fallback"
+        );
+        self.with_shared(|state| f(&mut ParserRecognizer { state }))
     }
 
     pub(crate) fn chop_tokens(&mut self, trie: &TokTrie, tokens: &[TokenId]) -> (usize, usize) {
@@ -2848,12 +2870,42 @@ impl Parser {
     }
 
     pub fn apply_token(&mut self, tok_bytes: &[u8], tok_id: TokenId) -> Result<usize> {
-        self.with_shared(|state| greedy_replay::apply_token(state, tok_bytes, tok_id))
+        self.with_shared(|state| {
+            let result = state.apply_token(tok_bytes, tok_id);
+            state.token_idx += 1;
+            if state.shared_box.greedy_replay.is_some() {
+                greedy_replay::with(state, |replay| {
+                    if matches!(result, Ok(0)) {
+                        replay.token_committed(tok_bytes, tok_id);
+                    } else {
+                        replay.discard_frontier();
+                    }
+                });
+            }
+            result
+        })
     }
 
     fn with_shared<T>(&mut self, f: impl FnOnce(&mut ParserState) -> T) -> T {
         let mut shared = self.shared.lock().unwrap();
-        greedy_replay::with_shared(&mut self.state, &mut shared, f)
+        let greedy = self.state.shared_box.greedy_replay.is_some();
+        std::mem::swap(&mut self.state.shared_box, &mut shared);
+        if greedy {
+            std::mem::swap(
+                &mut self.state.shared_box.greedy_replay,
+                &mut shared.greedy_replay,
+            );
+        }
+        let r = f(&mut self.state);
+        if greedy {
+            std::mem::swap(
+                &mut self.state.shared_box.greedy_replay,
+                &mut shared.greedy_replay,
+            );
+        }
+        std::mem::swap(&mut self.state.shared_box, &mut shared);
+        assert!(shared.lexer_opt.is_some());
+        r
     }
 
     pub fn rollback(&mut self, n_bytes: usize) -> Result<()> {
