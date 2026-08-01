@@ -876,17 +876,12 @@ impl ParserState {
                 computer.compute_bias(&mut recognizer, start)
             } else {
                 let mut set = computer.compute_bias(&mut ParserRecognizer { state }, start);
-                let mut fallback = greedy_replay::fork(state);
-                while let Some(mut branch) = fallback {
-                    fallback = greedy_replay::fork(&branch);
-                    set.or(
-                        &computer.compute_bias(&mut ParserRecognizer { state: &mut branch }, start)
-                    );
-                }
+                greedy_replay::visit_forks(state, |branch| {
+                    set.or(&computer.compute_bias(&mut ParserRecognizer { state: branch }, start));
+                });
                 set
             }
         });
-
         self.stats.lexer_cost = self.lexer().dfa.total_fuel_spent();
 
         // The SPECIAL_TOKEN_MARKER should never be allowed by itself
@@ -905,12 +900,10 @@ impl ParserState {
                 }
             });
         }
-
         let eos = computer.trie().eos_token();
         if eos != INVALID_TOKEN && start.is_empty() && self.lexer_allows_eos() {
             set.allow_token(eos);
         }
-
         if cacheable {
             let curr_state = self.lexer_state();
             self.bias_cache = Some(BiasCache {
@@ -1484,11 +1477,7 @@ impl ParserState {
         }
         trace!("force_bytes lexer_stack {}", self.lexer_stack.len());
         self.with_items_limit(self.limits.step_max_items, "ff_tokens", |s| {
-            while let Some(b) = if s.shared_box.greedy_replay.is_some() {
-                s.greedy_forced_byte()
-            } else {
-                s.forced_byte()
-            } {
+            while let Some(b) = s.forced_byte() {
                 debug!("  forced: {:?} 0x{:x}", b as char, b);
                 if b == TokTrie::SPECIAL_TOKEN_MARKER {
                     assert!(!s.has_pending_lexeme_bytes());
@@ -1521,6 +1510,9 @@ impl ParserState {
                                 all_ok = false;
                                 break;
                             }
+                            if s.shared_box.greedy_replay.is_some() {
+                                greedy_replay::with(s, |replay| replay.forced_byte_committed(b));
+                            }
                         }
 
                         if !all_ok {
@@ -1545,6 +1537,9 @@ impl ParserState {
                     // shouldn't happen?
                     debug!("  force_bytes reject {}", b as char);
                     break;
+                }
+                if s.shared_box.greedy_replay.is_some() {
+                    greedy_replay::with(s, |replay| replay.forced_byte_committed(b));
                 }
             }
         });
@@ -1677,7 +1672,16 @@ impl ParserState {
 
     pub fn is_accepting(&mut self) -> bool {
         if self.shared_box.greedy_replay.is_some() {
-            self.clone().is_accepting_inner()
+            let mut accepting = self.run_speculative("is_accepting", |s| s.is_accepting_inner());
+            if !accepting {
+                greedy_replay::visit_forks(self, |branch| {
+                    if !accepting {
+                        accepting = branch
+                            .run_speculative("greedy_is_accepting", |s| s.is_accepting_inner());
+                    }
+                });
+            }
+            accepting
         } else {
             self.run_speculative("is_accepting", |s| s.is_accepting_inner())
         }
@@ -1743,6 +1747,9 @@ impl ParserState {
     /// parser at this point, and returns it.  If there is
     /// no such byte, forced_byte() returns 'None'.
     fn forced_byte(&mut self) -> Option<u8> {
+        if self.shared_box.greedy_replay.is_some() {
+            return self.greedy_forced_byte();
+        }
         if self.is_accepting() {
             debug!("  in accept state, not forcing");
             return None;
@@ -1823,16 +1830,10 @@ impl ParserState {
         }
         let mut recognizer = ForkRecognizer::new(self);
         recognizer.trie_started("forced_byte");
-        let mut forced = None;
-        for byte in u8::MIN..=u8::MAX {
-            if recognizer.try_push_byte(byte) {
-                recognizer.pop_bytes(1);
-                if forced.replace(byte).is_some() {
-                    forced = None;
-                    break;
-                }
-            }
-        }
+        let forced = {
+            let mut allowed = (u8::MIN..=u8::MAX).filter(|&byte| recognizer.byte_allowed(byte));
+            allowed.next().filter(|_| allowed.next().is_none())
+        };
         recognizer.trie_finished();
         forced
     }
@@ -2766,13 +2767,12 @@ struct ForkRecognizer {
 }
 
 impl ForkRecognizer {
-    fn new(state: &ParserState) -> Self {
+    fn new(state: &mut ParserState) -> Self {
         let mut branches = vec![state.clone()];
-        while let Some(mut branch) = greedy_replay::fork(branches.last().unwrap()) {
-            branch.shared_box.greedy_replay = None;
-            branches.push(branch);
-        }
-        branches[0].shared_box.greedy_replay = None;
+        branches.extend(greedy_replay::forks(state));
+        branches
+            .iter_mut()
+            .for_each(|state| state.shared_box.greedy_replay = None);
         Self {
             branches,
             history: vec![],
@@ -2784,8 +2784,7 @@ impl Recognizer for ForkRecognizer {
     fn pop_bytes(&mut self, num: usize) {
         if num != 0 {
             let target = self.history.len() - num;
-            self.branches = self.history[target].clone();
-            self.history.truncate(target);
+            self.branches = self.history.split_off(target).remove(0);
         }
     }
     fn collapse(&mut self) {}
@@ -3054,16 +3053,40 @@ impl Parser {
     }
 
     pub fn apply_token(&mut self, tok_bytes: &[u8], tok_id: TokenId) -> Result<usize> {
-        let r = self.with_shared(|state| state.apply_token(tok_bytes, tok_id));
-        self.state.token_idx += 1;
-        r
+        self.with_shared(|state| {
+            let result = state.apply_token(tok_bytes, tok_id);
+            state.token_idx += 1;
+            if state.shared_box.greedy_replay.is_some() {
+                greedy_replay::with(state, |replay| {
+                    if matches!(result, Ok(0)) {
+                        replay.token_committed(tok_bytes, tok_id);
+                    } else {
+                        replay.discard_frontier();
+                    }
+                });
+            }
+            result
+        })
     }
 
     fn with_shared<T>(&mut self, f: impl FnOnce(&mut ParserState) -> T) -> T {
         let mut shared = self.shared.lock().unwrap();
-        std::mem::swap(&mut self.state.shared_box.lexer_opt, &mut shared.lexer_opt);
+        let greedy = self.state.shared_box.greedy_replay.is_some();
+        std::mem::swap(&mut self.state.shared_box, &mut shared);
+        if greedy {
+            std::mem::swap(
+                &mut self.state.shared_box.greedy_replay,
+                &mut shared.greedy_replay,
+            );
+        }
         let r = f(&mut self.state);
-        std::mem::swap(&mut self.state.shared_box.lexer_opt, &mut shared.lexer_opt);
+        if greedy {
+            std::mem::swap(
+                &mut self.state.shared_box.greedy_replay,
+                &mut shared.greedy_replay,
+            );
+        }
+        std::mem::swap(&mut self.state.shared_box, &mut shared);
         assert!(shared.lexer_opt.is_some());
         r
     }
@@ -3077,13 +3100,9 @@ impl Parser {
     pub fn validate_tokens(&mut self, tokens: &[TokenId]) -> usize {
         self.with_shared(|state| {
             let mut r = state.validate_tokens(tokens);
-            let mut fallback = greedy_replay::fork(state);
-            while r < tokens.len() {
-                let Some(mut branch) = fallback else { break };
-                fallback = greedy_replay::fork(&branch);
-                branch.shared_box.greedy_replay = None;
+            greedy_replay::visit_forks(state, |branch| {
                 r = r.max(branch.validate_tokens(tokens));
-            }
+            });
             debug!(
                 "validate_tokens: {} -> {}/{}",
                 state.tok_env.tok_trie().tokens_dbg(tokens),

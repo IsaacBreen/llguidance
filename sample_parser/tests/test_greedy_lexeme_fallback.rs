@@ -79,6 +79,32 @@ fn test_greedy_checkpoint_at_eos() {
 }
 
 #[test]
+fn test_greedy_fallback_accepting_boundary_preserves_state() {
+    let grammar = r#"
+        %llguidance {"no_forcing": true, "greedy_lexeme_fallback": true}
+        start: NUMBER
+        NUMBER: /[0-9]+/
+    "#;
+    let mut parser = make_parser(grammar, true).unwrap();
+    feed_greedy_text(&mut parser, "5");
+
+    let env = get_tok_env();
+    let eos = env.tok_trie().eos_token();
+    let mut suffix = env.tokenize("6");
+    suffix.push(eos);
+
+    for _ in 0..2 {
+        let mask = parser.compute_mask().unwrap();
+        assert!(mask.is_allowed(eos));
+        assert_eq!(parser.validate_tokens_raw(&suffix).unwrap(), suffix.len());
+        assert_eq!(parser.final_bytes(), b"5");
+    }
+
+    feed_greedy_text(&mut parser, "6");
+    assert!(parser.is_accepting());
+}
+
+#[test]
 fn test_greedy_shadow_long_checkpoint() {
     let n = 80usize;
     let grammar = format!(
