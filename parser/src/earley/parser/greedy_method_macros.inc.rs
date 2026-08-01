@@ -44,7 +44,10 @@ macro_rules! greedy_recognizer_access_methods {
                 self.state.shared_box.greedy_replay.is_none(),
                 "with_recognizer is unavailable with greedy_lexeme_fallback"
             );
-            self.with_shared(|state| f(&mut ParserRecognizer { state }))
+            self.with_shared(|state| {
+                let mut rec = ParserRecognizer { state };
+                f(&mut rec)
+            })
         }
 
         pub(crate) fn chop_tokens(&mut self, trie: &TokTrie, tokens: &[TokenId]) -> (usize, usize) {
@@ -63,18 +66,18 @@ macro_rules! greedy_state_transfer_methods {
     () => {
         pub fn apply_token(&mut self, tok_bytes: &[u8], tok_id: TokenId) -> Result<usize> {
             self.with_shared(|state| {
-                let result = state.apply_token(tok_bytes, tok_id);
+                let r = state.apply_token(tok_bytes, tok_id);
                 state.token_idx += 1;
                 if state.shared_box.greedy_replay.is_some() {
                     greedy_replay::with(state, |replay| {
-                        if matches!(result, Ok(0)) {
+                        if matches!(r, Ok(0)) {
                             replay.token_committed(tok_bytes, tok_id);
                         } else {
                             replay.discard_frontier();
                         }
                     });
                 }
-                result
+                r
             })
         }
 

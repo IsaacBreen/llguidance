@@ -723,7 +723,7 @@ impl ParserState {
         r.lexer_stack[0].lexer_state = state;
         r.assert_definitive();
 
-        let lexer = r.shared_box.lexer_opt.take().unwrap();
+        let lexer = std::mem::take(&mut r.shared_box.lexer_opt).unwrap();
 
         r.stats.lexer_cost = lexer.dfa.total_fuel_spent();
 
@@ -790,8 +790,8 @@ impl ParserState {
 
         let mut set = self.with_items_limit(limits.step_max_items, "mask", |state| {
             if state.shared_box.greedy_replay.is_none() {
-                let mut recognizer = ParserRecognizer { state };
-                computer.compute_bias(&mut recognizer, start)
+                let mut r = ParserRecognizer { state };
+                computer.compute_bias(&mut r, start)
             } else {
                 let mut set = computer.compute_bias(&mut ParserRecognizer { state }, start);
                 greedy_replay::visit_forks(state, |branch| {
