@@ -1,4 +1,7 @@
-use std::{fmt::Display, hint::black_box, panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow, fmt::Display, hint::black_box, ops::Range, panic::AssertUnwindSafe, sync::Arc,
+    time::Duration,
+};
 
 use crate::{
     api::{GrammarInit, ParserLimits, StopReason},
@@ -32,7 +35,7 @@ pub struct TokenParser {
     had_backtrack: bool,
 
     is_accepting_cache: Option<bool>,
-    ff_tokens_cache: Option<(Vec<TokenId>, Vec<u8>)>,
+    ff_tokens_cache: Option<(Vec<TokenId>, TokenPrefix)>,
     stop_reason: StopReason,
     error_message: Option<String>,
     max_tokens_total: usize,
@@ -42,7 +45,23 @@ pub struct TokenParser {
     llm_bytes: Vec<u8>,
 
     grm_prefix: Vec<u8>,
+    // The leading part of grm_prefix that has grammar semantics. These bytes
+    // must eventually be applied to the parser unless forcing already did so.
+    grm_prefix_parser_len: usize,
     is_fresh: bool,
+}
+
+#[derive(Clone, Default)]
+struct TokenPrefix {
+    // Bytes required at the start of the next model token.
+    bytes: Vec<u8>,
+    // The part of bytes that is not already represented by parser state.
+    parser_bytes: Range<usize>,
+}
+
+struct TokenApplication<'a> {
+    prefix_len: usize,
+    parser_bytes: Cow<'a, [u8]>,
 }
 
 impl TokenParser {
@@ -116,6 +135,7 @@ impl TokenParser {
             llm_tokens: Vec::new(),
             llm_bytes: Vec::new(),
             grm_prefix: Vec::new(),
+            grm_prefix_parser_len: 0,
             max_tokens_total: max_tokens,
             last_bias_time: Duration::from_secs(0),
             is_fresh: true,
@@ -172,7 +192,7 @@ impl TokenParser {
     }
 
     pub fn final_bytes(&self) -> &[u8] {
-        &self.llm_bytes[self.grm_prefix.len()..]
+        &self.llm_bytes[self.grm_prefix.len().min(self.llm_bytes.len())..]
     }
 
     pub fn is_accepting(&mut self) -> bool {
@@ -235,9 +255,9 @@ impl TokenParser {
 
         assert!(self.llm_tokens.is_empty());
 
-        let trie = self.token_env.tok_trie();
-        infoln!(self, "prompt: {}", trie.tokens_dbg(&prompt));
-        let mut prompt_bytes = trie.decode_raw(&prompt);
+        let prompt_dbg = self.token_env.tok_trie().tokens_dbg(&prompt);
+        infoln!(self, "prompt: {}", prompt_dbg);
+        let mut prompt_bytes = self.token_env.tok_trie().decode_raw(&prompt);
         if self.can_force_bytes() {
             self.parser.force_bytes();
         }
@@ -247,11 +267,11 @@ impl TokenParser {
         let (tokens, num_fixed) = self.token_env.tokenize_bytes_marker(&prompt_bytes);
         let (res_prompt, chop_bytes) = self.tokenize_and_chop(tokens, num_fixed);
 
-        let trie = self.token_env.tok_trie();
+        let res_prompt_dbg = self.token_env.tok_trie().tokens_dbg(&res_prompt);
         infoln!(
             self,
             "prompt+grm: {} {}",
-            trie.tokens_dbg(&res_prompt),
+            res_prompt_dbg,
             self.parser.grammar().lexer_spec().no_forcing
         );
 
@@ -270,12 +290,18 @@ impl TokenParser {
                 self.grm_prefix = decoded[0..1].to_vec();
                 self.llm_bytes = decoded;
             }
-            infoln!(self, "ini_tokens: {}", trie.tokens_dbg(&self.llm_tokens));
+            let ini_tokens_dbg = self.tok_trie().tokens_dbg(&self.llm_tokens);
+            infoln!(self, "ini_tokens: {}", ini_tokens_dbg);
         } else {
-            // pretend the final bit of prompt was the prefix of the grammar
+            // The chopped prompt suffix remains a required model-token prefix.
             self.grm_prefix = prompt_bytes
                 [prompt_bytes.len() - chop_bytes..prompt_bytes.len() - grm_bytes.len()]
                 .to_vec();
+            // Without parser-forced bytes, the healed prompt suffix has not yet
+            // been applied to the parser and must be applied when sampled.
+            if grm_bytes.is_empty() {
+                self.grm_prefix_parser_len = self.grm_prefix.len();
+            }
             infoln!(
                 self,
                 "force_prefix: {:?}",
@@ -283,7 +309,7 @@ impl TokenParser {
             );
         }
 
-        infoln!(self, "res_prompt: {}", trie.tokens_dbg(&res_prompt));
+        infoln!(self, "res_prompt: {}", res_prompt_dbg);
         res_prompt
     }
 
@@ -395,28 +421,31 @@ impl TokenParser {
         self.had_rollback = true;
 
         let new_len = self.llm_tokens.len() - n_tokens;
-        let mut bytes_to_drop = 0;
+        let mut llm_bytes_to_drop = 0;
         for tok in &self.llm_tokens[new_len..] {
             if self.eos_tokens.contains(tok) {
                 // doesn't count; we hope it's last though...
-                bytes_to_drop += 0;
+                llm_bytes_to_drop += 0;
             } else {
-                bytes_to_drop += self.tok_trie().token_len(*tok);
+                llm_bytes_to_drop += self.tok_trie().token_len(*tok);
             }
         }
+        let new_llm_bytes_len = self.llm_bytes.len() - llm_bytes_to_drop;
+        let parser_bytes_to_drop =
+            self.parser_bytes_in_llm_range(new_llm_bytes_len, self.llm_bytes.len());
         ensure!(
-            bytes_to_drop <= self.llm_bytes.len(),
+            llm_bytes_to_drop <= self.llm_bytes.len(),
             "rollback bytes: {} > {}",
-            bytes_to_drop,
+            llm_bytes_to_drop,
             self.llm_bytes.len()
         );
 
-        self.parser.rollback(bytes_to_drop)?;
+        self.parser.rollback(parser_bytes_to_drop)?;
 
         self.max_tokens_total = self.max_tokens_total.saturating_add(n_tokens);
         self.llm_tokens.truncate(new_len);
         self.llm_bytes
-            .truncate(self.llm_bytes.len() - bytes_to_drop);
+            .truncate(self.llm_bytes.len() - llm_bytes_to_drop);
         self.clear_caches();
 
         Ok(())
@@ -445,8 +474,33 @@ impl TokenParser {
             }
         }
 
-        let n_valid = self.parser.validate_tokens(tokens);
-        Ok(n_valid)
+        if self.pending_grm_prefix().is_empty() {
+            return Ok(self.parser.validate_tokens(tokens));
+        }
+
+        let mut parser = self.parser.deep_clone();
+        let mut llm_bytes_len = self.llm_bytes.len();
+        for (idx, &token) in tokens.iter().enumerate() {
+            if self.eos_tokens.contains(&token) {
+                return Ok(idx);
+            }
+            let token_bytes = self.tok_trie().decode_raw(&[token]);
+            let Some(application) = self.token_application(llm_bytes_len, &token_bytes) else {
+                return Ok(idx);
+            };
+            if !application.parser_bytes.is_empty()
+                && parser
+                    .apply_token(application.parser_bytes.as_ref(), token)
+                    .is_err()
+            {
+                return Ok(idx);
+            }
+            llm_bytes_len += token_bytes.len();
+            if llm_bytes_len >= self.grm_prefix.len() {
+                return Ok(idx + 1 + parser.validate_tokens(&tokens[idx + 1..]));
+            }
+        }
+        Ok(tokens.len())
     }
 
     fn anyhow_error(&self) -> anyhow::Error {
@@ -490,8 +544,11 @@ impl TokenParser {
             }
         } else {
             let mut trg = Vec::new();
-            self.compute_ff_bytes_to(&mut trg);
-            trg
+            let parser_bytes = self.compute_ff_bytes_to(&mut trg);
+            TokenPrefix {
+                bytes: trg,
+                parser_bytes,
+            }
         };
 
         let mut allowed_tokens = self.compute_bias(&prefix);
@@ -508,7 +565,7 @@ impl TokenParser {
             }
         }
 
-        self.log_final(&prefix, &allowed_tokens);
+        self.log_final(&prefix.bytes, &allowed_tokens);
 
         if allowed_tokens.is_zero() {
             infoln!(self, "no tokens allowed, stopping");
@@ -549,38 +606,36 @@ impl TokenParser {
             prefix_len
         );
 
-        let tok_bytes = if prefix_len > 0 {
+        let Some(application) = self.token_application(self.llm_bytes.len(), &tok_bytes) else {
             let to_apply = &tok_bytes[0..std::cmp::min(tok_bytes.len(), prefix_len)];
             self.llm_bytes.extend_from_slice(to_apply);
-
-            if self.grm_prefix[0..self.llm_bytes.len()] != self.llm_bytes {
-                return Err(self.stop(
-                    &format!(
-                        "prefix mismatch: applying {:?}; {:?} vs {:?}",
-                        String::from_utf8_lossy(to_apply),
-                        String::from_utf8_lossy(&self.grm_prefix),
-                        String::from_utf8_lossy(&self.llm_bytes)
-                    ),
-                    StopReason::InternalError,
-                ));
-            }
-
-            if prefix_len < tok_bytes.len() {
-                &tok_bytes[prefix_len..]
-            } else {
-                // still completely in prefix, nothing more to apply
-                return Ok(0);
-            }
-        } else {
-            &tok_bytes
+            return Err(self.stop(
+                &format!(
+                    "prefix mismatch: applying {:?}; {:?} vs {:?}",
+                    String::from_utf8_lossy(to_apply),
+                    String::from_utf8_lossy(&self.grm_prefix),
+                    String::from_utf8_lossy(&self.llm_bytes)
+                ),
+                StopReason::InternalError,
+            ));
         };
+        let token_suffix = &tok_bytes[application.prefix_len..];
+        self.llm_bytes
+            .extend_from_slice(&tok_bytes[..application.prefix_len]);
+
+        if application.parser_bytes.is_empty() && token_suffix.is_empty() {
+            return Ok(0);
+        }
 
         if let Some(err) = self.parser.get_error() {
             return Err(self.stop_for_parser_error("", err));
         }
 
         // now apply normally
-        match self.parser.apply_token(tok_bytes, tok_id) {
+        match self
+            .parser
+            .apply_token(application.parser_bytes.as_ref(), tok_id)
+        {
             Err(e) => {
                 return Err(self.stop(
                     &format!("Parser Error: {e}"),
@@ -588,26 +643,33 @@ impl TokenParser {
                 ));
             }
             Ok(backtrack_bytes0) => {
-                self.llm_bytes.extend_from_slice(tok_bytes);
+                self.llm_bytes.extend_from_slice(token_suffix);
 
                 if backtrack_bytes0 != 0 {
                     self.had_backtrack = true;
                     let mut backtrack_bytes: isize = backtrack_bytes0.try_into().unwrap();
                     let mut backtrack_tokens = 0;
+                    let mut byte_ptr = self.llm_bytes.len();
                     while backtrack_bytes > 0 {
                         let tok_off = self.llm_tokens.len() - backtrack_tokens;
                         if tok_off == 0 {
                             break; // we can't backtrack any further
                         }
                         let tok = self.llm_tokens[tok_off - 1];
-                        backtrack_bytes -= trie.token_len(tok) as isize;
+                        let tok_len = if self.eos_tokens.contains(&tok) {
+                            0
+                        } else {
+                            trie.token_len(tok)
+                        };
+                        let token_start = byte_ptr - tok_len;
+                        backtrack_bytes -=
+                            self.parser_bytes_in_llm_range(token_start, byte_ptr) as isize;
+                        byte_ptr = token_start;
                         backtrack_tokens += 1;
                     }
                     assert!(backtrack_tokens > 0);
                     let additional_backtrack_bytes: usize = (-backtrack_bytes).try_into().unwrap();
-                    let full_backtrack_bytes = backtrack_bytes0 + additional_backtrack_bytes;
-
-                    let byte_ptr = self.llm_bytes.len() - full_backtrack_bytes;
+                    let token_ptr = self.llm_tokens.len() - backtrack_tokens;
                     infoln!(
                         self,
                         "backtrack: {} tokens / {}+{} bytes (deletes: {:?})",
@@ -618,7 +680,6 @@ impl TokenParser {
                     );
                     self.llm_bytes.truncate(byte_ptr);
 
-                    let token_ptr = self.llm_tokens.len() - backtrack_tokens;
                     if !self.inference_caps.backtrack {
                         warn!(
                             self,
@@ -660,19 +721,32 @@ impl TokenParser {
         trg
     }
 
-    fn compute_ff_bytes_to(&mut self, trg: &mut Vec<u8>) {
+    fn compute_ff_bytes_to(&mut self, trg: &mut Vec<u8>) -> Range<usize> {
         // PERF: in some cases, this may be long
         if self.can_force_bytes() {
             self.parser.force_bytes();
         }
-        self.compute_ff_bytes_inner(trg);
+        self.compute_ff_bytes_inner(trg)
     }
 
-    fn compute_ff_bytes_inner(&mut self, trg: &mut Vec<u8>) {
+    fn compute_ff_bytes_inner(&mut self, trg: &mut Vec<u8>) -> Range<usize> {
+        let mut parser_bytes = 0..0;
+        let forced = self.parser.currently_forced_bytes();
+        let mut forced_start = 0;
         // handle grm_prefix we might have injected
         if self.llm_bytes.len() < self.grm_prefix.len() {
-            let inject = &self.grm_prefix[self.llm_bytes.len()..];
+            let prefix_start = self.llm_bytes.len();
+            let inject = &self.grm_prefix[prefix_start..];
+            let trg_start = trg.len();
             trg.extend_from_slice(inject);
+            if prefix_start < self.grm_prefix_parser_len {
+                let parser_prefix = &self.grm_prefix[prefix_start..self.grm_prefix_parser_len];
+                // Backtracking can expose the same bytes both as a healed
+                // prefix and as parser-forced bytes. Require them once and only
+                // advance the recognizer through the unrepresented suffix.
+                forced_start = common_prefix_len(parser_prefix, forced);
+                parser_bytes = trg_start + forced_start..trg_start + parser_prefix.len();
+            }
             infoln!(
                 self,
                 "injecting prefix: {:?}",
@@ -680,13 +754,14 @@ impl TokenParser {
             );
         }
 
-        trg.extend_from_slice(self.parser.currently_forced_bytes());
+        trg.extend_from_slice(&forced[forced_start..]);
+        parser_bytes
     }
 
     /// Converts forced bytes into tokens.
     /// Also returns any bytes that need to be prefix of the
     /// next sampled token (token healing).
-    fn ff_tokens(&mut self) -> (Vec<TokenId>, Vec<u8>) {
+    fn ff_tokens(&mut self) -> (Vec<TokenId>, TokenPrefix) {
         let mut forced_bytes = Vec::new();
         let mut existing_tokens = if self.llm_tokens.is_empty() {
             Vec::new()
@@ -698,9 +773,9 @@ impl TokenParser {
         };
         let num_existing_bytes = forced_bytes.len();
 
-        self.compute_ff_bytes_to(&mut forced_bytes);
+        let parser_bytes = self.compute_ff_bytes_to(&mut forced_bytes);
 
-        let mut token_prefix = Vec::new();
+        let mut token_prefix = TokenPrefix::default();
 
         let do_force =
             forced_bytes.len() > num_existing_bytes && self.token_env.tokenize_is_canonical();
@@ -742,7 +817,7 @@ impl TokenParser {
                 &forced_bytes[num_existing_bytes..],
                 grm_tokens
             );
-            token_prefix = forced_bytes[forced_bytes.len() - chop_bytes..].to_vec();
+            token_prefix = Self::suffix_token_prefix(&forced_bytes, chop_bytes, parser_bytes);
 
             self.parser.perf_counters().tokenize_ff.record(t0.elapsed());
 
@@ -751,23 +826,37 @@ impl TokenParser {
                     self,
                     "fixed_tokens: {}; prefix len {}",
                     trie.tokens_dbg(&grm_tokens),
-                    token_prefix.len()
+                    token_prefix.bytes.len()
                 );
                 return (grm_tokens, token_prefix);
             } else {
-                infoln!(self, "no fixed tokens; prefix len {}", token_prefix.len());
+                infoln!(
+                    self,
+                    "no fixed tokens; prefix len {}",
+                    token_prefix.bytes.len()
+                );
             }
         } else if forced_bytes.len() > num_existing_bytes {
             infoln!(self, "not-forcing {} bytes", forced_bytes.len());
-            token_prefix = forced_bytes[num_existing_bytes..].to_vec();
+            let chop_bytes = forced_bytes.len() - num_existing_bytes;
+            token_prefix = Self::suffix_token_prefix(&forced_bytes, chop_bytes, parser_bytes);
         }
 
         (Vec::new(), token_prefix)
     }
 
-    fn compute_bias(&mut self, token_prefix: &[u8]) -> SimpleVob {
+    fn compute_bias(&mut self, token_prefix: &TokenPrefix) -> SimpleVob {
         let pre_stats = self.parser.stats().clone();
-        let set = self.parser.compute_bias(&*self.bias_computer, token_prefix);
+        let set = if token_prefix.parser_bytes.is_empty() {
+            self.parser
+                .compute_bias(&*self.bias_computer, &token_prefix.bytes)
+        } else {
+            self.parser.compute_bias_with_token_prefix(
+                &*self.bias_computer,
+                &token_prefix.bytes,
+                token_prefix.parser_bytes.clone(),
+            )
+        };
         let p_stats = self.parser.stats().delta(&pre_stats);
         self.last_bias_time = Duration::from_micros(p_stats.compute_time_us);
         self.last_step_stats = p_stats.clone();
@@ -970,4 +1059,68 @@ impl TokenParser {
     pub fn invalidate_bias_cache(&mut self) {
         self.parser.invalidate_bias_cache();
     }
+
+    fn parser_bytes_in_llm_range(&self, start: usize, end: usize) -> usize {
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.llm_bytes.len());
+        debug_assert!(self.grm_prefix_parser_len <= self.grm_prefix.len());
+
+        let prefix_start = start.min(self.grm_prefix_parser_len);
+        let prefix_end = end.min(self.grm_prefix_parser_len);
+        let prefix_bytes = prefix_end - prefix_start;
+
+        let suffix_start = start.max(self.grm_prefix.len());
+        let suffix_bytes = end.saturating_sub(suffix_start);
+        prefix_bytes + suffix_bytes
+    }
+
+    fn token_application<'a>(
+        &self,
+        llm_bytes_len: usize,
+        token_bytes: &'a [u8],
+    ) -> Option<TokenApplication<'a>> {
+        let prefix_start = llm_bytes_len.min(self.grm_prefix.len());
+        let prefix_len = token_bytes.len().min(self.grm_prefix.len() - prefix_start);
+        if token_bytes[..prefix_len] != self.grm_prefix[prefix_start..prefix_start + prefix_len] {
+            return None;
+        }
+
+        let parser_prefix_len = self
+            .grm_prefix_parser_len
+            .saturating_sub(prefix_start)
+            .min(prefix_len);
+        let suffix = &token_bytes[prefix_len..];
+        let parser_bytes = if parser_prefix_len == 0 {
+            Cow::Borrowed(suffix)
+        } else if parser_prefix_len == prefix_len {
+            Cow::Borrowed(token_bytes)
+        } else {
+            let mut bytes = Vec::with_capacity(parser_prefix_len + suffix.len());
+            bytes.extend_from_slice(&token_bytes[..parser_prefix_len]);
+            bytes.extend_from_slice(suffix);
+            Cow::Owned(bytes)
+        };
+        Some(TokenApplication {
+            prefix_len,
+            parser_bytes,
+        })
+    }
+
+    fn suffix_token_prefix(
+        bytes: &[u8],
+        suffix_len: usize,
+        parser_bytes: Range<usize>,
+    ) -> TokenPrefix {
+        let suffix_start = bytes.len() - suffix_len;
+        let parser_start = parser_bytes.start.max(suffix_start);
+        let parser_end = parser_bytes.end.max(suffix_start);
+        TokenPrefix {
+            bytes: bytes[suffix_start..].to_vec(),
+            parser_bytes: parser_start - suffix_start..parser_end - suffix_start,
+        }
+    }
+}
+
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).take_while(|(a, b)| a == b).count()
 }

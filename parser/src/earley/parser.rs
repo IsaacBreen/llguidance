@@ -2644,6 +2644,97 @@ pub trait BiasComputer: Send + Sync {
     fn trie(&self) -> &TokTrie;
 }
 
+struct TokenPrefixBiasComputer<'a> {
+    inner: &'a dyn BiasComputer,
+    // All candidate tokens must begin with this byte sequence.
+    token_prefix: &'a [u8],
+    // Only this part of token_prefix is not yet represented by parser state.
+    parser_bytes: Range<usize>,
+}
+
+impl BiasComputer for TokenPrefixBiasComputer<'_> {
+    fn compute_bias(&self, rec: &mut ParserRecognizer<'_>, _start: &[u8]) -> SimpleVob {
+        let mut set = self.trie().alloc_token_set();
+        let mut rec = TokenPrefixRecognizer {
+            inner: rec,
+            token_prefix: self.token_prefix,
+            parser_bytes: self.parser_bytes.clone(),
+            depth: 0,
+            collapsed_depth: 0,
+        };
+        self.trie().add_bias(&mut rec, &mut set, &[]);
+        set
+    }
+
+    fn trie(&self) -> &TokTrie {
+        self.inner.trie()
+    }
+}
+
+struct TokenPrefixRecognizer<'a, 'b> {
+    inner: &'a mut ParserRecognizer<'b>,
+    token_prefix: &'a [u8],
+    parser_bytes: Range<usize>,
+    depth: usize,
+    collapsed_depth: usize,
+}
+
+impl Recognizer for TokenPrefixRecognizer<'_, '_> {
+    fn pop_bytes(&mut self, num: usize) {
+        debug_assert!(num <= self.depth - self.collapsed_depth);
+        let new_depth = self.depth - num;
+
+        let parser_start = new_depth.max(self.parser_bytes.start);
+        let parser_end = self.depth.min(self.parser_bytes.end);
+        let parser_bytes = parser_end.saturating_sub(parser_start);
+
+        let suffix_start = new_depth.max(self.token_prefix.len());
+        let suffix_bytes = self.depth.saturating_sub(suffix_start);
+
+        self.depth = new_depth;
+        self.inner.pop_bytes(parser_bytes + suffix_bytes);
+    }
+
+    fn collapse(&mut self) {
+        self.inner.collapse();
+        self.collapsed_depth = self.depth;
+    }
+
+    fn trie_started(&mut self, dbg_lbl: &str) {
+        self.depth = 0;
+        self.collapsed_depth = 0;
+        self.inner.trie_started(dbg_lbl);
+    }
+
+    fn trie_finished(&mut self) {
+        self.inner.trie_finished();
+        self.depth = 0;
+        self.collapsed_depth = 0;
+    }
+
+    fn try_push_byte(&mut self, byte: u8) -> bool {
+        let idx = self.depth;
+        if idx < self.token_prefix.len() && self.token_prefix[idx] != byte {
+            return false;
+        }
+
+        let forward = idx >= self.token_prefix.len() || self.parser_bytes.contains(&idx);
+        if forward && !self.inner.try_push_byte(byte) {
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    fn get_error(&mut self) -> Option<String> {
+        self.inner.get_error()
+    }
+
+    fn save_stats(&mut self, nodes_walked: usize) {
+        self.inner.save_stats(nodes_walked);
+    }
+}
+
 // Processing of the parser and the lexer is heavily interlocked.
 // The 'Recognizer' trait is used as the interface for this.
 // See the documentation for TokTrie in README.md and toktrie.md:
@@ -2775,6 +2866,22 @@ impl Parser {
     /// the LLInterpreter interface.
     pub fn compute_bias(&mut self, computer: &dyn BiasComputer, start: &[u8]) -> SimpleVob {
         self.with_shared(|state| state.compute_bias(computer, start))
+    }
+
+    pub(crate) fn compute_bias_with_token_prefix(
+        &mut self,
+        computer: &dyn BiasComputer,
+        token_prefix: &[u8],
+        parser_bytes: Range<usize>,
+    ) -> SimpleVob {
+        debug_assert!(!token_prefix.is_empty());
+        debug_assert!(parser_bytes.end <= token_prefix.len());
+        let computer = TokenPrefixBiasComputer {
+            inner: computer,
+            token_prefix,
+            parser_bytes,
+        };
+        self.with_shared(|state| state.compute_bias(&computer, token_prefix))
     }
 
     pub fn captures(&self) -> &[(String, Vec<u8>)] {
