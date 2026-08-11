@@ -11,7 +11,7 @@ permissions:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - name: Machine
@@ -23,7 +23,7 @@ jobs:
       - name: Fetch tokenizer and real JSONSchemaBench cases
         run: |
           set -euxo pipefail
-          mkdir -p /tmp/spec-study
+          mkdir -p /tmp/spec-study/cases
           curl -L --fail --retry 4 --retry-delay 2 \
             -o /tmp/spec-study/tokenizer.json \
             'https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/resolve/main/tokenizer.json?download=true'
@@ -49,23 +49,19 @@ jobs:
               'Github_medium---o9802',
               'Github_ultra---o21137',
           ]
-          cases = []
           for name in names:
               payload = json.loads((root / f'{name}.json').read_text())
               examples = [
                   json.dumps(t['data'], ensure_ascii=False)
                   for t in payload['tests']
                   if t.get('valid') is True
-              ]
+              ][:2]
               if not examples:
-                  print('SKIP no positive examples', name)
+                  print('CASE_NO_POSITIVE', name)
                   continue
-              # At most two real examples per problem; enough to locate a representative tail.
-              examples = examples[:2]
-              print(name, 'schema_bytes=', len(json.dumps(payload['schema'])), 'positive_examples=', len(examples), 'chars=', [len(x) for x in examples])
-              cases.append({'name': name, 'schema': payload['schema'], 'examples': examples})
-          (root / 'cases.json').write_text(json.dumps(cases, ensure_ascii=False))
-          print('cases_written=', len(cases))
+              case = [{'name': name, 'schema': payload['schema'], 'examples': examples}]
+              (root / 'cases' / f'{name}.json').write_text(json.dumps(case, ensure_ascii=False))
+              print('CASE_INPUT', name, 'schema_bytes=', len(json.dumps(payload['schema'])), 'positive_examples=', len(examples), 'chars=', [len(x) for x in examples])
           PY
       - name: Configure study workload
         run: |
@@ -75,7 +71,6 @@ jobs:
           s = p.read_text()
           s = s.replace('const SCAN_REPS: usize = 5;', 'const SCAN_REPS: usize = 3;')
           s = s.replace('const SPEC_REPS: usize = 20;', 'const SPEC_REPS: usize = 10;')
-          # Realistic-ish short legal alternatives rather than deliberately longest tokens.
           s = s.replace('bytes.len() > 48', 'bytes.len() > 12')
           s = s.replace(
               'out.sort_by_key(|&id| (Reverse(env.token_bytes[id as usize].len()), id));',
@@ -83,8 +78,17 @@ jobs:
           )
           p.write_text(s)
           PY
-      - name: Build and run study
-        env:
-          REAL_CFA_TOKENIZER: /tmp/spec-study/tokenizer.json
-          REAL_CFA_CASES: /tmp/spec-study/cases.json
-        run: cargo run --release -p llguidance --example spec_real_cfa_bench
+      - name: Build benchmark once
+        run: cargo build --release -p llguidance --example spec_real_cfa_bench
+      - name: Run each case independently
+        run: |
+          set +e
+          binary=target/release/examples/spec_real_cfa_bench
+          for case_file in /tmp/spec-study/cases/*.json; do
+            case_name=$(basename "$case_file" .json)
+            echo "===== STUDY_CASE_BEGIN $case_name ====="
+            REAL_CFA_TOKENIZER=/tmp/spec-study/tokenizer.json REAL_CFA_CASES="$case_file" "$binary"
+            rc=$?
+            echo "===== STUDY_CASE_END $case_name rc=$rc ====="
+          done
+          exit 0
