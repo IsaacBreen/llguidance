@@ -55,6 +55,22 @@ jobs:
           (root / 'cases.json').write_text(json.dumps(cases, ensure_ascii=False))
           PY
           ls -lh /tmp/cfa-real
+      - name: Prefer short/common speculative alternatives
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('parser/examples/spec_real_cfa_bench.rs')
+          s = p.read_text()
+          s = s.replace('bytes.len() > 48', 'bytes.len() > 12')
+          s = s.replace(
+              'out.sort_by_key(|&id| (Reverse(env.token_bytes[id as usize].len()), id));',
+              'out.sort_unstable();'
+          )
+          p.write_text(s)
+          assert 'bytes.len() > 12' in s
+          assert 'out.sort_unstable();' in s
+          PY
+          echo 'candidate policy: printable base-vocab tokens, <=12 bytes, ascending token id'
       - name: Build and run
         env:
           REAL_CFA_TOKENIZER: /tmp/cfa-real/tokenizer.json
