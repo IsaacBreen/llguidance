@@ -1,0 +1,24 @@
+name: Temporary Speculative Branch Benchmark
+
+on:
+  push:
+    branches:
+      - bench/spec-masked-20260811-r2
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Machine
+        run: |
+          uname -a
+          lscpu
+          rustc --version
+          cargo --version
+      - name: Build and run
+        run: cargo run --release -p llguidance --example spec_branch_bench
