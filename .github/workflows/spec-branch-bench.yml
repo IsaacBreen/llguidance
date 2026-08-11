@@ -1,14 +1,90 @@
-name: Temporary Real CFA Speculative Branch Benchmark
+name: Broad speculative branching study
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - bench/spec-study-20260811
 
 permissions:
   contents: read
 
 jobs:
   bench:
-    if: ${{ false }}
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
-      - run: echo 'Temporary benchmark disabled; see real-cfa-spec-benchmark-results-2026-08-11.md'
+      - uses: actions/checkout@v6
+      - name: Machine
+        run: |
+          uname -a
+          lscpu
+          rustc --version
+          cargo --version
+      - name: Fetch tokenizer and real JSONSchemaBench cases
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/spec-study
+          curl -L --fail --retry 4 --retry-delay 2 \
+            -o /tmp/spec-study/tokenizer.json \
+            'https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/resolve/main/tokenizer.json?download=true'
+          cases='Github_easy---o9772 Github_hard---o1184 Github_hard---o14404 Github_hard---o21073 Github_hard---o35186 Github_hard---o44196 Github_hard---o62060 Github_hard---o9882 Github_medium---o9802 Github_ultra---o21137'
+          for case in $cases; do
+            curl -L --fail --retry 4 \
+              -o "/tmp/spec-study/${case}.json" \
+              "https://raw.githubusercontent.com/guidance-ai/jsonschemabench/ba103c73756198dd9b149ddc7db7867da7a077f6/maskbench/data/${case}.json"
+          done
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path('/tmp/spec-study')
+          names = [
+              'Github_easy---o9772',
+              'Github_hard---o1184',
+              'Github_hard---o14404',
+              'Github_hard---o21073',
+              'Github_hard---o35186',
+              'Github_hard---o44196',
+              'Github_hard---o62060',
+              'Github_hard---o9882',
+              'Github_medium---o9802',
+              'Github_ultra---o21137',
+          ]
+          cases = []
+          for name in names:
+              payload = json.loads((root / f'{name}.json').read_text())
+              examples = [
+                  json.dumps(t['data'], ensure_ascii=False)
+                  for t in payload['tests']
+                  if t.get('valid') is True
+              ]
+              if not examples:
+                  print('SKIP no positive examples', name)
+                  continue
+              # At most two real examples per problem; enough to locate a representative tail.
+              examples = examples[:2]
+              print(name, 'schema_bytes=', len(json.dumps(payload['schema'])), 'positive_examples=', len(examples), 'chars=', [len(x) for x in examples])
+              cases.append({'name': name, 'schema': payload['schema'], 'examples': examples})
+          (root / 'cases.json').write_text(json.dumps(cases, ensure_ascii=False))
+          print('cases_written=', len(cases))
+          PY
+      - name: Configure study workload
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('parser/examples/spec_real_cfa_bench.rs')
+          s = p.read_text()
+          s = s.replace('const SCAN_REPS: usize = 5;', 'const SCAN_REPS: usize = 3;')
+          s = s.replace('const SPEC_REPS: usize = 20;', 'const SPEC_REPS: usize = 10;')
+          # Realistic-ish short legal alternatives rather than deliberately longest tokens.
+          s = s.replace('bytes.len() > 48', 'bytes.len() > 12')
+          s = s.replace(
+              'out.sort_by_key(|&id| (Reverse(env.token_bytes[id as usize].len()), id));',
+              'out.sort_unstable();'
+          )
+          p.write_text(s)
+          PY
+      - name: Build and run study
+        env:
+          REAL_CFA_TOKENIZER: /tmp/spec-study/tokenizer.json
+          REAL_CFA_CASES: /tmp/spec-study/cases.json
+        run: cargo run --release -p llguidance --example spec_real_cfa_bench
