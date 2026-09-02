@@ -328,9 +328,7 @@ Example: `%llguidance { "no_forcing": true }`.
 It can be specified multiple times, with the options being merged.
 
 Set `"lexer_backtracking": true` to let the lexer backtrack to the last valid
-lexeme match if a longer match later fails. For example, with
-`STEM: "list" | "listen"` followed by `SUFFIX: "ed"`, this allows `listed`
-to be read as `list` followed by `ed`. The option is disabled by default.
+lexeme match if a longer match later fails. This option is disabled by default.
 
 By default, a `%ignore` regex can be matched repeatedly at the same grammar
 position. Set `"ignore_once": true` to make the regex describe the entire
